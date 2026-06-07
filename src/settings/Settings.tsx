@@ -337,17 +337,34 @@ export function Settings() {
     await save({ groqKey: t } as any, 'Groq key saved');
     setHasGroqKey(true); setGroqKey('••••••••••••••••••••');
   }
-  async function saveOpenrouterKey() {
-    const t = openrouterKey.trim();
-    if (!t || t.startsWith('•')) { flash('err', 'Please enter a key'); return; }
-    await save({ openrouterKey: t } as any, 'OpenRouter key saved');
-    setHasOpenrouterKey(true); setOpenrouterKey('••••••••••••••••••••');
+  // Unified per-provider save. Collects every editable field for the chosen
+  // provider into one patch and persists with a single toast — replaces the
+  // old "save on each blur" pattern. Key fields are masked once stored, so
+  // a value starting with • means "unchanged" and is skipped.
+  async function saveOpenrouterConfig() {
+    const patch: Record<string, unknown> = { gptModel };
+    const k = openrouterKey.trim();
+    if (k && !k.startsWith('•')) {
+      patch.openrouterKey = k;
+    } else if (!hasOpenrouterKey) {
+      flash('err', 'Please enter an API key');
+      return;
+    }
+    await save(patch, 'OpenRouter settings saved');
+    if (patch.openrouterKey) { setHasOpenrouterKey(true); setOpenrouterKey('••••••••••••••••••••'); }
   }
-  async function saveCustomKey() {
-    const t = customKey.trim();
-    if (!t || t.startsWith('•')) { flash('err', 'Please enter a key'); return; }
-    await save({ customKey: t } as any, 'Custom key saved');
-    setHasCustomKey(true); setCustomKey('••••••••••••••••••••');
+  async function saveCustomConfig() {
+    const patch: Record<string, unknown> = { customBaseUrl, customChatModel, customHeaders };
+    const k = customKey.trim();
+    if (k && !k.startsWith('•')) {
+      patch.customKey = k;
+    } else if (!hasCustomKey) {
+      flash('err', 'Please enter an API key');
+      return;
+    }
+    if (!customBaseUrl.trim()) { flash('err', 'Base URL is required'); return; }
+    await save(patch, 'Custom settings saved');
+    if (patch.customKey) { setHasCustomKey(true); setCustomKey('••••••••••••••••••••'); }
   }
   function flash(kind: 'ok' | 'err', msg: string) {
     setToast({ kind, msg });
@@ -637,60 +654,94 @@ export function Settings() {
                       onChange={() => setGroqKey('')} onRemove={() => { save({ groqKey: '' } as any, 'Key removed'); setHasGroqKey(false); setGroqKey(''); }} />
                   )}
 
-                  {/* OpenRouter: key + chat model. STT silently falls back. */}
+                  {/* OpenRouter: key + chat model, ONE Save for both. */}
                   {gptProvider === 'openrouter' && (
-                    <>
-                      <KeyCard label="OpenRouter API Key" has={hasOpenrouterKey} val={openrouterKey} setVal={setOpenrouterKey} onSave={saveOpenrouterKey} prefix="sk-or-"
-                        onChange={() => setOpenrouterKey('')}
-                        onRemove={() => { save({ openrouterKey: '' } as any, 'Key removed'); setHasOpenrouterKey(false); setOpenrouterKey(''); }} />
-                      <Card>
-                        <Label>Chat Model</Label>
-                        <HelpText>Find model IDs at openrouter.ai/models</HelpText>
-                        <input type="text" value={gptModel} onChange={(e) => setGptModel(e.target.value)} onBlur={() => save({ gptModel })}
-                          placeholder="e.g. meta-llama/llama-3.1-8b-instruct"
-                          className={inputCls} />
-                      </Card>
+                    <Card>
+                      <Label>OpenRouter Configuration</Label>
+                      <HelpText>One Save persists key + model. STT silently falls back to your OpenAI or Groq key.</HelpText>
+                      <div className="space-y-3 mt-2">
+                        <div>
+                          <div className="text-[10px] uppercase tracking-wider text-white/40 mb-1">API Key {hasOpenrouterKey && <span className="text-green-400/80 normal-case ml-1">✓ saved</span>}</div>
+                          <input type="password" value={openrouterKey} onChange={(e) => setOpenrouterKey(e.target.value)}
+                            onFocus={() => { if (openrouterKey.startsWith('•')) setOpenrouterKey(''); }}
+                            placeholder="sk-or-..." className={inputCls} />
+                        </div>
+                        <div>
+                          <div className="text-[10px] uppercase tracking-wider text-white/40 mb-1">Chat Model</div>
+                          <input type="text" value={gptModel} onChange={(e) => setGptModel(e.target.value)}
+                            placeholder="e.g. meta-llama/llama-3.1-8b-instruct"
+                            className={inputCls} />
+                          <HelpText>Find model IDs at openrouter.ai/models</HelpText>
+                        </div>
+                        <div className="flex items-center justify-between gap-2 pt-1">
+                          {hasOpenrouterKey ? (
+                            <button onClick={() => { save({ openrouterKey: '' } as any, 'Key removed'); setHasOpenrouterKey(false); setOpenrouterKey(''); }}
+                              className="px-3 py-1.5 rounded-md text-[11px] text-red-400/80 hover:text-red-400 hover:bg-red-500/10 border border-red-500/20">Remove key</button>
+                          ) : <span />}
+                          <button onClick={saveOpenrouterConfig}
+                            className="px-5 py-1.5 rounded-md text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white transition-colors">
+                            Save Configuration
+                          </button>
+                        </div>
+                      </div>
                       {!hasKey && !hasGroqKey && (
-                        <div className="text-[11px] text-amber-400 bg-amber-500/5 rounded-lg px-3 py-2 border border-amber-500/20">
-                          OpenRouter doesn't transcribe audio. Add an OpenAI or Groq key (in their tab) for STT fallback, or switch to Local mode.
+                        <div className="text-[11px] text-amber-400 bg-amber-500/5 rounded-lg px-3 py-2 border border-amber-500/20 mt-3">
+                          OpenRouter doesn't transcribe audio. Add an OpenAI or Groq key for STT fallback, or switch to Local mode.
                         </div>
                       )}
-                    </>
+                    </Card>
                   )}
 
-                  {/* Custom: full config */}
+                  {/* Custom: full config (key + base URL + model + headers), ONE Save. */}
                   {gptProvider === 'custom' && (
-                    <>
-                      <KeyCard label="Custom API Key" has={hasCustomKey} val={customKey} setVal={setCustomKey} onSave={saveCustomKey} prefix=""
-                        onChange={() => setCustomKey('')}
-                        onRemove={() => { save({ customKey: '' } as any, 'Key removed'); setHasCustomKey(false); setCustomKey(''); }} />
-                      <Card>
-                        <Label>Base URL</Label>
-                        <HelpText>OpenAI-compatible endpoint root (e.g. .../v1). The /chat/completions path is appended automatically.</HelpText>
-                        <input type="text" value={customBaseUrl} onChange={(e) => setCustomBaseUrl(e.target.value)} onBlur={() => save({ customBaseUrl })}
-                          placeholder="https://freellmapi.webdevarif.com/v1"
-                          className={inputCls} />
-                      </Card>
-                      <Card>
-                        <Label>Chat Model</Label>
-                        <input type="text" value={customChatModel} onChange={(e) => setCustomChatModel(e.target.value)} onBlur={() => save({ customChatModel })}
-                          placeholder="e.g. auto, gpt-4o-mini, llama-3.1-70b"
-                          className={inputCls} />
-                      </Card>
-                      <Card>
-                        <Label>Extra Headers (JSON, optional)</Label>
-                        <HelpText>For providers that need custom headers, e.g. HTTP-Referer. Leave blank if unsure.</HelpText>
-                        <textarea value={customHeaders} onChange={(e) => setCustomHeaders(e.target.value)} onBlur={() => save({ customHeaders })}
-                          placeholder='{"HTTP-Referer":"https://example.com"}'
-                          rows={2}
-                          className={inputCls + ' resize-none font-mono text-xs'} />
-                      </Card>
+                    <Card>
+                      <Label>Custom API Configuration</Label>
+                      <HelpText>OpenAI-compatible endpoint. Fill all fields and click Save once.</HelpText>
+                      <div className="space-y-3 mt-2">
+                        <div>
+                          <div className="text-[10px] uppercase tracking-wider text-white/40 mb-1">API Key {hasCustomKey && <span className="text-green-400/80 normal-case ml-1">✓ saved</span>}</div>
+                          <input type="password" value={customKey} onChange={(e) => setCustomKey(e.target.value)}
+                            onFocus={() => { if (customKey.startsWith('•')) setCustomKey(''); }}
+                            placeholder="your-api-key" className={inputCls} />
+                        </div>
+                        <div>
+                          <div className="text-[10px] uppercase tracking-wider text-white/40 mb-1">Base URL</div>
+                          <input type="text" value={customBaseUrl} onChange={(e) => setCustomBaseUrl(e.target.value)}
+                            placeholder="https://freellmapi.webdevarif.com/v1"
+                            className={inputCls} />
+                          <HelpText>OpenAI-compatible endpoint root. The /chat/completions path is appended automatically.</HelpText>
+                        </div>
+                        <div>
+                          <div className="text-[10px] uppercase tracking-wider text-white/40 mb-1">Chat Model</div>
+                          <input type="text" value={customChatModel} onChange={(e) => setCustomChatModel(e.target.value)}
+                            placeholder="e.g. auto, gpt-4o-mini, llama-3.1-70b"
+                            className={inputCls} />
+                        </div>
+                        <div>
+                          <div className="text-[10px] uppercase tracking-wider text-white/40 mb-1">Extra Headers (JSON, optional)</div>
+                          <textarea value={customHeaders} onChange={(e) => setCustomHeaders(e.target.value)}
+                            placeholder='{"HTTP-Referer":"https://example.com"}'
+                            rows={2}
+                            className={inputCls + ' resize-none font-mono text-xs'} />
+                          <HelpText>Optional. Provider-specific headers as JSON.</HelpText>
+                        </div>
+                        <div className="flex items-center justify-between gap-2 pt-1">
+                          {hasCustomKey ? (
+                            <button onClick={() => { save({ customKey: '' } as any, 'Key removed'); setHasCustomKey(false); setCustomKey(''); }}
+                              className="px-3 py-1.5 rounded-md text-[11px] text-red-400/80 hover:text-red-400 hover:bg-red-500/10 border border-red-500/20">Remove key</button>
+                          ) : <span />}
+                          <button onClick={saveCustomConfig}
+                            className="px-5 py-1.5 rounded-md text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white transition-colors">
+                            Save Configuration
+                          </button>
+                        </div>
+                      </div>
                       {!hasKey && !hasGroqKey && (
-                        <div className="text-[11px] text-amber-400 bg-amber-500/5 rounded-lg px-3 py-2 border border-amber-500/20">
+                        <div className="text-[11px] text-amber-400 bg-amber-500/5 rounded-lg px-3 py-2 border border-amber-500/20 mt-3">
                           Most custom proxies don't transcribe audio. Add an OpenAI or Groq key for STT fallback, or switch to Local mode.
                         </div>
                       )}
-                    </>
+                    </Card>
                   )}
                 </>
               )}
