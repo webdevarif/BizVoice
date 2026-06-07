@@ -1,6 +1,6 @@
 {
   "name": "bizvoice",
-  "version": "0.1.21",
+  "version": "0.1.22",
   "description": "AI voice typing for Windows — Whisper + GPT powered, works in any app",
   "main": "dist-electron/main/index.js",
   "author": "BizVoice",
