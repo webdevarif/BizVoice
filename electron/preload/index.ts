@@ -32,6 +32,8 @@ contextBridge.exposeInMainWorld('api', {
   muteSystem: (mute: boolean) => ipcRenderer.invoke('audio:mute', mute),
   getHistory: () => ipcRenderer.invoke('history:get') as Promise<{ text: string; ts: number; words: number; durationMs: number }[]>,
   clearHistory: () => ipcRenderer.invoke('history:clear'),
+  refineText: (text: string, ts: number) => ipcRenderer.invoke('history:refine', text, ts) as Promise<string>,
+  getRefinedCache: () => ipcRenderer.invoke('history:getRefinedCache') as Promise<Record<number, string>>,
   getStats: () => ipcRenderer.invoke('stats:get') as Promise<{ recordings: number; words: number; durationMs: number }>,
   whisperListModels: () => ipcRenderer.invoke('whisper:listModels'),
   whisperDownloadModel: (name: string) => ipcRenderer.invoke('whisper:downloadModel', name),
@@ -95,6 +97,8 @@ declare global {
       muteSystem: (mute: boolean) => Promise<void>;
       getHistory: () => Promise<{ text: string; ts: number; words: number; durationMs: number }[]>;
       clearHistory: () => Promise<void>;
+      refineText: (text: string, ts: number) => Promise<string>;
+      getRefinedCache: () => Promise<Record<number, string>>;
       getStats: () => Promise<{ recordings: number; words: number; durationMs: number }>;
       whisperListModels: () => Promise<{ name: string; size: string; downloaded: boolean }[]>;
       whisperDownloadModel: (name: string) => Promise<{ ok: boolean; error?: string }>;

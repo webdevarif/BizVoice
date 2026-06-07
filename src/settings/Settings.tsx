@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import Lenis from 'lenis';
+import ReactSelect, { type StylesConfig } from 'react-select';
 
 type Tab = 'overview' | 'history' | 'dictionary' | 'instructions' | 'general' | 'shortcuts' | 'languages' | 'audio' | 'appearance' | 'about';
 type Lang = string;
@@ -132,6 +133,10 @@ export function Settings() {
   const [widgetStyle, setWidgetStyle] = useState('logoText');
   const [instructions, setInstructions] = useState('');
   const [history, setHistory] = useState<HistEntry[]>([]);
+  const [historyPage, setHistoryPage] = useState(0);
+  const [refined, setRefined] = useState<Record<number, string>>({});
+  const [refining, setRefining] = useState<Record<number, boolean>>({});
+  const HISTORY_PER_PAGE = 10;
   const [stats, setStats] = useState<{ recordings: number; words: number; durationMs: number }>({ recordings: 0, words: 0, durationMs: 0 });
   const [dictSearch, setDictSearch] = useState('');
   const [newTerm, setNewTerm] = useState({ from: '', to: '', category: '' });
@@ -213,9 +218,29 @@ export function Settings() {
   }, []);
 
   useEffect(() => {
-    if (tab === 'history' || tab === 'overview') window.api.getHistory().then(setHistory);
+    if (tab === 'history' || tab === 'overview') {
+      window.api.getHistory().then(async (h) => {
+        setHistory(h);
+        const cached = await window.api.getRefinedCache();
+        setRefined(cached);
+      });
+      setHistoryPage(0);
+    }
     if (tab === 'overview') window.api.getStats().then(setStats);
   }, [tab]);
+
+  async function refineEntry(entry: HistEntry) {
+    if (refining[entry.ts] || refined[entry.ts]) return;
+    setRefining((m) => ({ ...m, [entry.ts]: true }));
+    try {
+      const r = await window.api.refineText(entry.text, entry.ts);
+      if (r) setRefined((m) => ({ ...m, [entry.ts]: r }));
+    } catch (e: any) {
+      flash('err', e?.message || 'Refine failed');
+    } finally {
+      setRefining((m) => { const c = { ...m }; delete c[entry.ts]; return c; });
+    }
+  }
 
   async function loadMics() {
     try {
@@ -542,11 +567,15 @@ export function Settings() {
                   {sttProvider === 'openai' && (
                     <Card>
                       <Label>Transcription Model</Label>
-                      <select value={sttModel} onChange={(e) => { setSttModel(e.target.value); save({ sttModel: e.target.value }); }} className={inputCls}>
-                        <option value="gpt-4o-mini-transcribe">gpt-4o-mini-transcribe — fast</option>
-                        <option value="gpt-4o-transcribe">gpt-4o-transcribe — best accuracy</option>
-                        <option value="whisper-1">whisper-1 — legacy</option>
-                      </select>
+                      <Select
+                        value={sttModel}
+                        onChange={(v) => { setSttModel(v); save({ sttModel: v }); }}
+                        options={[
+                          { value: 'gpt-4o-mini-transcribe', label: 'gpt-4o-mini-transcribe — fast' },
+                          { value: 'gpt-4o-transcribe',      label: 'gpt-4o-transcribe — best accuracy' },
+                          { value: 'whisper-1',              label: 'whisper-1 — legacy' },
+                        ]}
+                      />
                     </Card>
                   )}
                 </>
@@ -562,10 +591,16 @@ export function Settings() {
                   <Toggle on={!skipGpt} onClick={() => { const v = !skipGpt; setSkipGpt(v); save({ skipGpt: v }, v ? 'Fast mode' : 'AI formatting on'); }} />
                 </div>
                 {!skipGpt && (
-                  <select value={gptModel} onChange={(e) => { setGptModel(e.target.value); save({ gptModel: e.target.value }); }} className={inputCls + ' mt-3'}>
-                    <option value="gpt-4o-mini">gpt-4o-mini — fast, cheap</option>
-                    <option value="gpt-4o">gpt-4o — best quality</option>
-                  </select>
+                  <div className="mt-3">
+                    <Select
+                      value={gptModel}
+                      onChange={(v) => { setGptModel(v); save({ gptModel: v }); }}
+                      options={[
+                        { value: 'gpt-4o-mini', label: 'gpt-4o-mini — fast, cheap' },
+                        { value: 'gpt-4o',      label: 'gpt-4o — best quality' },
+                      ]}
+                    />
+                  </div>
                 )}
               </Card>
             </Section>
@@ -605,9 +640,12 @@ export function Settings() {
               <Card>
                 <Label>Spoken Language</Label>
                 <HelpText>Choosing a specific language improves accuracy over Auto-detect.</HelpText>
-                <select value={inputLang} onChange={(e) => { const v = e.target.value as Lang; setInputLang(v); save({ inputLang: v }); }} className={inputCls}>
-                  {LANGS.map((l) => <option key={l.value} value={l.value}>{l.label}</option>)}
-                </select>
+                <Select
+                  value={inputLang}
+                  onChange={(v) => { setInputLang(v); save({ inputLang: v }); }}
+                  options={LANGS.map((l) => ({ value: l.value, label: l.label }))}
+                  isSearchable
+                />
               </Card>
               <Card>
                 <Label>Custom Vocabulary</Label>
@@ -628,17 +666,27 @@ export function Settings() {
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <div className="text-[10px] uppercase tracking-wider text-white/40 mb-1">Primary</div>
-                    <select value={micDeviceId} onChange={(e) => { setMicDeviceId(e.target.value); save({ micDeviceId: e.target.value }, 'Microphone updated'); }} className={inputCls}>
-                      <option value="default">System default</option>
-                      {mics.map((m) => <option key={m.deviceId} value={m.deviceId}>{m.label}</option>)}
-                    </select>
+                    <Select
+                      value={micDeviceId}
+                      onChange={(v) => { setMicDeviceId(v); save({ micDeviceId: v }, 'Microphone updated'); }}
+                      options={[
+                        { value: 'default', label: 'System default' },
+                        ...mics.map((m) => ({ value: m.deviceId, label: m.label })),
+                      ]}
+                      isSearchable
+                    />
                   </div>
                   <div>
                     <div className="text-[10px] uppercase tracking-wider text-white/40 mb-1">Fallback</div>
-                    <select value={micFallbackId} onChange={(e) => { setMicFallbackId(e.target.value); save({ micFallbackId: e.target.value }, 'Fallback updated'); }} className={inputCls}>
-                      <option value="default">System default</option>
-                      {mics.map((m) => <option key={m.deviceId} value={m.deviceId}>{m.label}</option>)}
-                    </select>
+                    <Select
+                      value={micFallbackId}
+                      onChange={(v) => { setMicFallbackId(v); save({ micFallbackId: v }, 'Fallback updated'); }}
+                      options={[
+                        { value: 'default', label: 'System default' },
+                        ...mics.map((m) => ({ value: m.deviceId, label: m.label })),
+                      ]}
+                      isSearchable
+                    />
                   </div>
                 </div>
                 {activeMicLabel && (
@@ -771,32 +819,87 @@ export function Settings() {
           )}
 
           {/* ── HISTORY ── */}
-          {tab === 'history' && (
-            <Section title="History" description="Your recent transcriptions. Click any entry to copy it.">
-              {history.length > 0 && (
-                <button onClick={async () => { await window.api.clearHistory(); setHistory([]); flash('ok', 'History cleared'); }}
-                  className="text-[11px] text-red-400/70 hover:text-red-400 mb-1">Clear all history</button>
-              )}
-              {history.length === 0 ? (
-                <div className="text-xs text-white/40 bg-white/[0.02] rounded-lg px-4 py-8 border border-white/5 text-center">No transcriptions yet. Start dictating!</div>
-              ) : (
-                <div className="space-y-2">
-                  {history.map((h, i) => (
-                    <div key={i} onClick={() => { navigator.clipboard.writeText(h.text); flash('ok', 'Copied'); }}
-                      className="bg-white/[0.02] border border-white/5 rounded-lg px-4 py-3 cursor-pointer hover:border-white/15 transition-all group">
-                      <div className="text-sm text-white/85 leading-snug">{h.text}</div>
-                      <div className="flex items-center gap-3 mt-2 text-[10px] text-white/35">
-                        <span>{new Date(h.ts).toLocaleString([], { hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric' })}</span>
-                        <span className="px-1.5 py-0.5 rounded bg-white/5">{h.words || h.text.trim().split(/\s+/).filter(Boolean).length} words</span>
-                        {h.durationMs > 0 && <span className="px-1.5 py-0.5 rounded bg-white/5">{fmtDuration(h.durationMs)}</span>}
-                        <span className="text-blue-400 opacity-0 group-hover:opacity-100 transition-opacity ml-auto">Click to copy</span>
-                      </div>
+          {tab === 'history' && (() => {
+            const totalPages = Math.max(1, Math.ceil(history.length / HISTORY_PER_PAGE));
+            const page = Math.min(historyPage, totalPages - 1);
+            const start = page * HISTORY_PER_PAGE;
+            const pageItems = history.slice(start, start + HISTORY_PER_PAGE);
+            return (
+              <Section title="History" description="Your recent transcriptions. Click the original to copy, or refine to see a grammar-corrected version.">
+                {history.length > 0 && (
+                  <button onClick={async () => { await window.api.clearHistory(); setHistory([]); setRefined({}); flash('ok', 'History cleared'); }}
+                    className="text-[11px] text-red-400/70 hover:text-red-400 mb-1">Clear all history</button>
+                )}
+                {history.length === 0 ? (
+                  <div className="text-xs text-white/40 bg-white/[0.02] rounded-lg px-4 py-8 border border-white/5 text-center">No transcriptions yet. Start dictating!</div>
+                ) : (
+                  <>
+                    <div className="space-y-2">
+                      {pageItems.map((h) => {
+                        const ref = refined[h.ts];
+                        const isRefining = !!refining[h.ts];
+                        return (
+                          <div key={h.ts}
+                            className="bg-white/[0.02] border border-white/5 rounded-lg px-4 py-3 hover:border-white/15 transition-all group">
+                            {/* Original (top) */}
+                            <div className="flex items-start gap-2">
+                              <span className="text-[9px] font-semibold text-white/35 tracking-wider mt-1 shrink-0">YOU</span>
+                              <div onClick={() => { navigator.clipboard.writeText(h.text); flash('ok', 'Original copied'); }}
+                                className="text-sm text-white/85 leading-snug cursor-pointer flex-1">{h.text}</div>
+                            </div>
+
+                            {/* Refined (bottom) — visible if cached, button if not */}
+                            {ref ? (
+                              <div className="flex items-start gap-2 mt-2 pt-2 border-t border-white/5">
+                                <span className="text-[9px] font-semibold text-blue-400/80 tracking-wider mt-1 shrink-0">REFINED</span>
+                                <div onClick={() => { navigator.clipboard.writeText(ref); flash('ok', 'Refined copied'); }}
+                                  className="text-sm text-blue-100/85 leading-snug cursor-pointer flex-1">{ref}</div>
+                              </div>
+                            ) : (
+                              <button onClick={() => refineEntry(h)} disabled={isRefining}
+                                className="mt-2 text-[11px] text-blue-400/70 hover:text-blue-400 disabled:opacity-50 disabled:cursor-wait">
+                                {isRefining ? 'Refining…' : '✨ Refine sentence'}
+                              </button>
+                            )}
+
+                            <div className="flex items-center gap-3 mt-2 text-[10px] text-white/35">
+                              <span>{new Date(h.ts).toLocaleString([], { hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric' })}</span>
+                              <span className="px-1.5 py-0.5 rounded bg-white/5">{h.words || h.text.trim().split(/\s+/).filter(Boolean).length} words</span>
+                              {h.durationMs > 0 && <span className="px-1.5 py-0.5 rounded bg-white/5">{fmtDuration(h.durationMs)}</span>}
+                            </div>
+                          </div>
+                        );
+                      })}
                     </div>
-                  ))}
-                </div>
-              )}
-            </Section>
-          )}
+
+                    {/* Pagination controls */}
+                    {totalPages > 1 && (
+                      <div className="flex items-center justify-between mt-4 text-xs">
+                        <div className="text-white/40">
+                          Showing {start + 1}–{Math.min(start + HISTORY_PER_PAGE, history.length)} of {history.length}
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <button onClick={() => setHistoryPage(Math.max(0, page - 1))} disabled={page === 0}
+                            className="px-2.5 py-1 rounded border border-white/10 text-white/70 hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed">Prev</button>
+                          {Array.from({ length: totalPages }, (_, i) => i)
+                            .filter((i) => i === 0 || i === totalPages - 1 || Math.abs(i - page) <= 1)
+                            .map((i, idx, arr) => (
+                              <span key={i} className="flex items-center">
+                                {idx > 0 && arr[idx - 1] !== i - 1 && <span className="px-1 text-white/30">…</span>}
+                                <button onClick={() => setHistoryPage(i)}
+                                  className={`min-w-[28px] px-2 py-1 rounded border text-center ${i === page ? 'bg-blue-600/30 border-blue-500/40 text-white' : 'border-white/10 text-white/70 hover:bg-white/5'}`}>{i + 1}</button>
+                              </span>
+                            ))}
+                          <button onClick={() => setHistoryPage(Math.min(totalPages - 1, page + 1))} disabled={page >= totalPages - 1}
+                            className="px-2.5 py-1 rounded border border-white/10 text-white/70 hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed">Next</button>
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+              </Section>
+            );
+          })()}
 
           {/* ── INSTRUCTIONS ── */}
           {tab === 'instructions' && (
@@ -874,6 +977,82 @@ export function Settings() {
 
 // ---------- UI helpers ----------
 const inputCls = 'w-full bg-[#1a1a22] border border-white/10 rounded-md px-3 py-2 text-sm outline-none focus:border-blue-500 focus:bg-[#1f1f28] transition-colors';
+
+// ---------- Themed dropdown (replaces native <select>) ----------
+type SelOpt = { value: string; label: string };
+
+const selectStyles: StylesConfig<SelOpt, false> = {
+  control: (base, state) => ({
+    ...base,
+    background: state.isFocused ? '#1f1f28' : '#1a1a22',
+    borderColor: state.isFocused ? '#3b82f6' : 'rgba(255,255,255,0.1)',
+    boxShadow: 'none',
+    minHeight: '38px',
+    borderRadius: '6px',
+    fontSize: '14px',
+    cursor: 'pointer',
+    transition: 'all 150ms',
+    '&:hover': { borderColor: state.isFocused ? '#3b82f6' : 'rgba(255,255,255,0.2)' },
+  }),
+  valueContainer: (base) => ({ ...base, padding: '2px 12px' }),
+  singleValue:    (base) => ({ ...base, color: 'rgba(255,255,255,0.9)' }),
+  placeholder:    (base) => ({ ...base, color: 'rgba(255,255,255,0.4)' }),
+  input:          (base) => ({ ...base, color: 'rgba(255,255,255,0.9)' }),
+  indicatorSeparator: () => ({ display: 'none' }),
+  dropdownIndicator: (base, state) => ({
+    ...base,
+    color: state.isFocused ? '#3b82f6' : 'rgba(255,255,255,0.5)',
+    padding: '6px 8px',
+    '&:hover': { color: 'white' },
+  }),
+  menu: (base) => ({
+    ...base,
+    background: '#1a1a22',
+    border: '1px solid rgba(255,255,255,0.1)',
+    borderRadius: '6px',
+    boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
+    overflow: 'hidden',
+    marginTop: '4px',
+  }),
+  menuPortal: (base) => ({ ...base, zIndex: 9999 }),
+  menuList:   (base) => ({ ...base, padding: '4px' }),
+  option: (base, state) => ({
+    ...base,
+    background: state.isSelected
+      ? 'rgba(59,130,246,0.25)'
+      : state.isFocused
+      ? 'rgba(255,255,255,0.05)'
+      : 'transparent',
+    color: state.isSelected ? 'white' : 'rgba(255,255,255,0.85)',
+    fontSize: '13px',
+    padding: '8px 10px',
+    borderRadius: '4px',
+    cursor: 'pointer',
+    '&:active': { background: 'rgba(59,130,246,0.35)' },
+  }),
+  noOptionsMessage: (base) => ({ ...base, color: 'rgba(255,255,255,0.4)', fontSize: '13px' }),
+};
+
+function Select({ value, onChange, options, placeholder, isSearchable = false }: {
+  value: string;
+  onChange: (v: string) => void;
+  options: SelOpt[];
+  placeholder?: string;
+  isSearchable?: boolean;
+}) {
+  const selected = options.find((o) => o.value === value) ?? null;
+  return (
+    <ReactSelect<SelOpt>
+      value={selected}
+      onChange={(o) => o && onChange(o.value)}
+      options={options}
+      placeholder={placeholder}
+      isSearchable={isSearchable}
+      menuPortalTarget={typeof document !== 'undefined' ? document.body : undefined}
+      styles={selectStyles}
+    />
+  );
+}
 
 function Section({ title, description, children }: { title: string; description: string; children: React.ReactNode }) {
   return (

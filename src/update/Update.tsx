@@ -61,7 +61,7 @@ export function Update() {
             {stage === 'ready'
               ? 'Restart BizVoice to apply the update.'
               : stage === 'downloading'
-              ? `Pulling v${rel?.version ?? ''} from GitHub…`
+              ? `Downloading v${rel?.version ?? ''}…`
               : `You're on v${current}. A newer BizVoice is ready.`}
           </p>
         </div>

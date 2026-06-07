@@ -801,6 +801,77 @@ ipcMain.handle('history:get', async () => {
 });
 ipcMain.handle('history:clear', async () => {
   try { await bghAuthFetch('/api/bizvoice/history', { method: 'DELETE' }); } catch { /* ignore */ }
+  store.set('refinedCache' as any, {});
+});
+
+// ── History refine ─────────────────────────────────────────────────────────
+// On-demand grammar-correction of a past transcription. The refined output is
+// cached locally (keyed by original entry timestamp) so subsequent views don't
+// re-hit the API. History entries themselves live in BizGrowHub; only the
+// cached corrections live here.
+//
+// Provider selection mirrors the user's STT preference so they aren't forced
+// to set a second API key:
+//   - sttProvider 'groq'   → Groq chat (llama-3.1-8b-instant — fast + cheap)
+//   - sttProvider 'openai' → OpenAI chat (S.gptModel)
+//   - useLocalWhisper      → no local LLM bundled, so we fall back to whatever
+//                            cloud key the user has (Groq preferred for speed)
+const REFINE_SYSTEM_PROMPT =
+  "You correct grammar, spelling, and punctuation in the user's transcribed speech. " +
+  "Keep the original meaning, tone, and language. Do NOT translate. " +
+  "Do NOT add greetings, explanations, or commentary. " +
+  "Return ONLY the corrected sentence — nothing else.";
+
+async function callRefine(text: string): Promise<string> {
+  const openaiKey = getApiKey();
+  const groqKey   = getGroqKey();
+  const prefersGroq = S.sttProvider === 'groq';
+
+  // Pick provider: match STT preference where possible, else fall back to
+  // whatever key is set (Groq first when both exist — it's faster).
+  let provider: 'groq' | 'openai';
+  if (prefersGroq && groqKey)        provider = 'groq';
+  else if (!prefersGroq && openaiKey) provider = 'openai';
+  else if (groqKey)                   provider = 'groq';
+  else if (openaiKey)                 provider = 'openai';
+  else throw new Error('Refine needs an OpenAI or Groq API key. Open Settings → Transcription.');
+
+  const OpenAI = (await import('openai')).default;
+  const client = provider === 'groq'
+    ? new OpenAI({ apiKey: groqKey,   baseURL: 'https://api.groq.com/openai/v1' })
+    : new OpenAI({ apiKey: openaiKey });
+  const model = provider === 'groq' ? 'llama-3.1-8b-instant' : (S.gptModel || 'gpt-4o-mini');
+
+  logEvent('info', `refine via ${provider} (${model})`);
+  const completion = await client.chat.completions.create({
+    model,
+    temperature: 0.2,
+    max_tokens: Math.min(1024, Math.ceil(text.length * 1.5) + 64),
+    messages: [
+      { role: 'system', content: REFINE_SYSTEM_PROMPT },
+      { role: 'user',   content: text },
+    ],
+  });
+  const refined = completion.choices[0]?.message?.content?.trim();
+  if (!refined) throw new Error('Empty refinement result');
+  return refined;
+}
+
+ipcMain.handle('history:refine', async (_e, text: string, ts: number) => {
+  const cache = (store.get('refinedCache' as any) as Record<string, string>) || {};
+  if (cache[String(ts)]) return cache[String(ts)];
+  const refined = await callRefine(text);
+  cache[String(ts)] = refined;
+  store.set('refinedCache' as any, cache);
+  return refined;
+});
+
+ipcMain.handle('history:getRefinedCache', () => {
+  const cache = (store.get('refinedCache' as any) as Record<string, string>) || {};
+  // Convert string keys back to number keys for the renderer's Record<number, string>
+  const out: Record<number, string> = {};
+  for (const [k, v] of Object.entries(cache)) out[Number(k)] = v;
+  return out;
 });
 ipcMain.handle('stats:get', async () => {
   try {
@@ -1012,11 +1083,17 @@ const TYPE_PS_SCRIPT = [
   '    public const uint KEYEVENTF_UNICODE = 0x0004;',
   '    public const ushort VK_RETURN = 0x0D;',
   '',
+  '    // Small inter-key delay (ms). Terminals (conhost, Windows Terminal) drop',
+  '    // or merge keystrokes when SendInput floods their input buffer too fast,',
+  '    // so we throttle just enough to stay reliable without feeling slow.',
+  '    public const int KEY_DELAY_MS = 3;',
+  '',
   '    public static void Type(string text) {',
   '        foreach (char c in text) {',
   "            if (c == '\\r') { continue; }",
   "            if (c == '\\n') { SendVk(VK_RETURN); }",
   '            else { SendUnicode(c); }',
+  '            if (KEY_DELAY_MS > 0) Thread.Sleep(KEY_DELAY_MS);',
   '        }',
   '    }',
   '',
