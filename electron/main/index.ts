@@ -1191,6 +1191,25 @@ const TYPE_PS_SCRIPT = [
   '        return false;',
   '    }',
   '',
+  '    // Web browsers host all kinds of TUIs (Hermes Agent, web Claude Code,',
+  '    // Cloud Shell, xterm.js apps). The browser holds focus and forwards',
+  '    // Ctrl+V to the page, where the TUI in raw mode intercepts it. No',
+  '    // shortcut reliably reaches the TUI — char-typing is the only path',
+  '    // that works universally for browser-hosted terminals.',
+  '    public static bool IsBrowser(string proc) {',
+  '        if (string.IsNullOrEmpty(proc)) return false;',
+  '        proc = proc.ToLowerInvariant();',
+  '        return proc == "chrome.exe"',
+  '            || proc == "msedge.exe"',
+  '            || proc == "firefox.exe"',
+  '            || proc == "brave.exe"',
+  '            || proc == "opera.exe"',
+  '            || proc == "vivaldi.exe"',
+  '            || proc == "arc.exe"',
+  '            || proc == "zen.exe"',
+  '            || proc == "librewolf.exe";',
+  '    }',
+  '',
   '    public static bool IsTerminal(string cls) {',
   '        if (string.IsNullOrEmpty(cls)) return false;',
   '        if (cls == "CASCADIA_HOSTING_WINDOW_CLASS") return true;  // Windows Terminal',
@@ -1270,11 +1289,18 @@ const TYPE_PS_SCRIPT = [
   '            $text = [Text.Encoding]::UTF8.GetString($bytes)',
   '            [Typer]::Type($text)',
   "        } elseif ($line.StartsWith('SMART:')) {",
-  '            # Legacy alias for PASTE — Paste() now picks the right shortcut',
-  '            # (Shift+Insert for editors/terminals, Ctrl+V elsewhere) so we',
-  '            # do not need a separate code path for terminals here. Payload',
-  '            # is ignored; the clipboard is already staged by Node.',
-  '            [Typer]::Paste()',
+  '            # Three-way decision based on the focused process:',
+  '            #   browser  → char-type (web-hosted TUIs intercept Ctrl+V)',
+  '            #   else     → Paste() picks Shift+Insert / Ctrl+V itself',
+  '            $b64 = $line.Substring(6)',
+  '            $bytes = [Convert]::FromBase64String($b64)',
+  '            $text = [Text.Encoding]::UTF8.GetString($bytes)',
+  '            $proc = [Typer]::GetForegroundProcessName()',
+  '            if ([Typer]::IsBrowser($proc)) {',
+  '                [Typer]::Type($text)',
+  '            } else {',
+  '                [Typer]::Paste()',
+  '            }',
   '        }',
   '    } catch {',
   '        # ignore line errors so the worker keeps running',
@@ -1310,16 +1336,19 @@ function pasteWindows(text: string) {
     logEvent('error', 'type proc not available');
     return;
   }
-  // Stage text on clipboard, then have the helper send the right paste
-  // shortcut for the focused app. The helper picks Shift+Insert for editors
-  // (Cursor / VS Code / Windsurf — bypasses the editor's Ctrl+V binding so
-  // it reaches the integrated terminal pane, which pastes via bracketed
-  // paste so TUIs like Claude Code accept the text) and for true terminal
-  // windows; Ctrl+V everywhere else. This is the same approach Wispr Flow
-  // uses on Windows.
+  // Stage text on clipboard AND pass it as a base64 payload — the helper
+  // chooses per-app:
+  //   - Browser (chrome/edge/firefox/etc.) → character-type the payload
+  //     (web-hosted TUIs like Hermes Agent / web Claude Code intercept Ctrl+V
+  //     since the browser forwards keystrokes to the page; only raw key
+  //     events reach the TUI cleanly).
+  //   - Editor (Cursor/VS Code/Windsurf/Trae) → Shift+Insert from clipboard.
+  //   - Native terminal (Windows Terminal/conhost/mintty) → Shift+Insert.
+  //   - Everything else → Ctrl+V from clipboard.
   const prev = clipboard.readText();
   clipboard.writeText(text);
-  setTimeout(() => { typeProc?.stdin?.write('PASTE\n'); }, 50);
+  const b64 = Buffer.from(text, 'utf-8').toString('base64');
+  setTimeout(() => { typeProc?.stdin?.write(`SMART:${b64}\n`); }, 50);
   setTimeout(() => { try { clipboard.writeText(prev); } catch {} }, 2000);
 }
 
