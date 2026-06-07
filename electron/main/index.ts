@@ -1,5 +1,6 @@
 import { app, BrowserWindow, globalShortcut, ipcMain, Tray, Menu, nativeImage, safeStorage, clipboard, session, systemPreferences, screen, shell, dialog } from 'electron';
 import { autoUpdater } from 'electron-updater';
+import type OpenAI from 'openai';
 import { join } from 'path';
 import { exec, spawn, type ChildProcess } from 'child_process';
 import { writeFileSync } from 'fs';
@@ -31,15 +32,23 @@ type Mode = {
   prompt: string;
 };
 
+type GptProvider = 'openai' | 'groq' | 'openrouter' | 'custom';
+
 type Settings = {
   openaiKeyEncrypted: string;
   groqKeyEncrypted: string;
+  openrouterKeyEncrypted: string;
+  customKeyEncrypted: string;
+  customBaseUrl: string;
+  customChatModel: string;
+  customHeaders: string;  // JSON string, e.g. '{"HTTP-Referer":"..."}'
   hotkey: string;
   pttHotkey: string;
   cycleHotkey: string;
   inputLang: Lang;
   outputLang: Lang;
-  gptModel: 'gpt-4o-mini' | 'gpt-4o';
+  gptModel: string;       // any string now (model name varies by provider)
+  gptProvider: GptProvider;
   sttModel: string;
   sttProvider: 'openai' | 'groq';
   skipGpt: boolean;
@@ -89,12 +98,18 @@ const store = new Store<Settings>({
   defaults: {
     openaiKeyEncrypted: '',
     groqKeyEncrypted: '',
+    openrouterKeyEncrypted: '',
+    customKeyEncrypted: '',
+    customBaseUrl: '',
+    customChatModel: '',
+    customHeaders: '',
     hotkey: 'CommandOrControl+Shift+Space',
     pttHotkey: 'CommandOrControl+Space',
     cycleHotkey: 'CommandOrControl+Shift+M',
     inputLang: 'auto',
     outputLang: 'auto',
     gptModel: 'gpt-4o-mini',
+    gptProvider: 'openai' as const,
     sttModel: 'whisper-1',
     sttProvider: 'openai' as const,
     skipGpt: true,
@@ -149,9 +164,10 @@ let S: Settings = { ...store.store };
 
 const DATA_KEYS: (keyof Settings)[] = [
   'hotkey', 'pttHotkey', 'cycleHotkey', 'inputLang', 'outputLang', 'gptModel', 'sttModel',
-  'sttProvider', 'skipGpt', 'launchOnStartup', 'micDeviceId', 'vocabulary', 'modes', 'activeMode',
+  'sttProvider', 'gptProvider', 'skipGpt', 'launchOnStartup', 'micDeviceId', 'vocabulary', 'modes', 'activeMode',
   'silenceMs', 'autoStop', 'useLocalWhisper', 'localModel', 'micFallbackId', 'muteWhileRecording',
   'dictionary', 'theme', 'widgetStyle', 'instructions',
+  'customBaseUrl', 'customChatModel', 'customHeaders',
 ];
 
 function bghAuthFetch(path: string, init: RequestInit = {}) {
@@ -796,8 +812,14 @@ ipcMain.handle('settings:get', async () => {
     theme: S.theme,
     widgetStyle: S.widgetStyle,
     instructions: S.instructions,
-    hasKey: !!store.get('openaiKeyEncrypted'),
-    hasGroqKey: !!store.get('groqKeyEncrypted'),
+    gptProvider: S.gptProvider,
+    customBaseUrl: S.customBaseUrl,
+    customChatModel: S.customChatModel,
+    customHeaders: S.customHeaders,
+    hasKey:           !!store.get('openaiKeyEncrypted'),
+    hasGroqKey:       !!store.get('groqKeyEncrypted'),
+    hasOpenrouterKey: !!store.get('openrouterKeyEncrypted'),
+    hasCustomKey:     !!store.get('customKeyEncrypted'),
   };
 });
 
@@ -820,39 +842,50 @@ ipcMain.handle('history:clear', async () => {
 // re-hit the API. History entries themselves live in BizGrowHub; only the
 // cached corrections live here.
 //
-// Provider selection mirrors the user's STT preference so they aren't forced
-// to set a second API key:
-//   - sttProvider 'groq'   → Groq chat (llama-3.1-8b-instant — fast + cheap)
-//   - sttProvider 'openai' → OpenAI chat (S.gptModel)
-//   - useLocalWhisper      → no local LLM bundled, so we fall back to whatever
-//                            cloud key the user has (Groq preferred for speed)
+// Honours the user's gptProvider preference; falls back through other
+// configured keys when the selected provider has no key.
 const REFINE_SYSTEM_PROMPT =
   "You correct grammar, spelling, and punctuation in the user's transcribed speech. " +
   "Keep the original meaning, tone, and language. Do NOT translate. " +
   "Do NOT add greetings, explanations, or commentary. " +
   "Return ONLY the corrected sentence — nothing else.";
 
-async function callRefine(text: string): Promise<string> {
-  const openaiKey = getApiKey();
-  const groqKey   = getGroqKey();
-  const prefersGroq = S.sttProvider === 'groq';
+type RefineClient = { client: OpenAI; model: string; label: string };
 
-  // Pick provider: match STT preference where possible, else fall back to
-  // whatever key is set (Groq first when both exist — it's faster).
-  let provider: 'groq' | 'openai';
-  if (prefersGroq && groqKey)        provider = 'groq';
-  else if (!prefersGroq && openaiKey) provider = 'openai';
-  else if (groqKey)                   provider = 'groq';
-  else if (openaiKey)                 provider = 'openai';
-  else throw new Error('Refine needs an OpenAI or Groq API key. Open Settings → Transcription.');
-
+async function buildRefineClient(): Promise<RefineClient> {
   const OpenAI = (await import('openai')).default;
-  const client = provider === 'groq'
-    ? new OpenAI({ apiKey: groqKey,   baseURL: 'https://api.groq.com/openai/v1' })
-    : new OpenAI({ apiKey: openaiKey });
-  const model = provider === 'groq' ? 'llama-3.1-8b-instant' : (S.gptModel || 'gpt-4o-mini');
+  const want = S.gptProvider ?? 'openai';
 
-  logEvent('info', `refine via ${provider} (${model})`);
+  const openaiKey     = getApiKey();
+  const groqKey       = getGroqKey();
+  const openrouterKey = getOpenrouterKey();
+  const customKey     = getCustomKey();
+
+  const tryBuild = (p: GptProvider): RefineClient | null => {
+    if (p === 'openai'     && openaiKey)     return { client: new OpenAI({ apiKey: openaiKey }), model: S.gptModel || 'gpt-4o-mini', label: 'openai' };
+    if (p === 'groq'       && groqKey)       return { client: new OpenAI({ apiKey: groqKey, baseURL: 'https://api.groq.com/openai/v1' }), model: 'llama-3.1-8b-instant', label: 'groq' };
+    if (p === 'openrouter' && openrouterKey) return { client: new OpenAI({ apiKey: openrouterKey, baseURL: 'https://openrouter.ai/api/v1', defaultHeaders: { 'HTTP-Referer': 'https://github.com/webdevarif/BizVoice', 'X-Title': 'BizVoice' } }), model: S.gptModel || 'meta-llama/llama-3.1-8b-instruct', label: 'openrouter' };
+    if (p === 'custom'     && customKey && S.customBaseUrl) {
+      let headers: Record<string, string> = {};
+      if (S.customHeaders) { try { headers = JSON.parse(S.customHeaders); } catch {} }
+      return { client: new OpenAI({ apiKey: customKey, baseURL: S.customBaseUrl, defaultHeaders: headers }), model: S.customChatModel || S.gptModel || 'auto', label: 'custom' };
+    }
+    return null;
+  };
+
+  // First: try the user's chosen provider. Then fall back to any other
+  // configured key in a sensible order (cheap/fast first).
+  const order: GptProvider[] = [want, ...(['groq', 'openai', 'openrouter', 'custom'] as GptProvider[]).filter((p) => p !== want)];
+  for (const p of order) {
+    const built = tryBuild(p);
+    if (built) return built;
+  }
+  throw new Error('Refine needs an API key (OpenAI, Groq, OpenRouter, or Custom). Open Settings → Transcription.');
+}
+
+async function callRefine(text: string): Promise<string> {
+  const { client, model, label } = await buildRefineClient();
+  logEvent('info', `refine via ${label} (${model})`);
   const completion = await client.chat.completions.create({
     model,
     temperature: 0.2,
@@ -891,33 +924,27 @@ ipcMain.handle('stats:get', async () => {
   } catch { return { recordings: 0, words: 0, durationMs: 0 }; }
 });
 
-ipcMain.handle('settings:set', (_e, patch: Partial<Settings & { openaiKey: string }>) => {
+// Encrypt-or-clear a single key field. Centralises the safeStorage pattern
+// used for every provider key (OpenAI, Groq, OpenRouter, Custom).
+function persistEncryptedKey(storeKey: keyof Settings, raw: string) {
+  if (raw === '') { store.set(storeKey, '' as any); return; }
+  const enc = safeStorage.isEncryptionAvailable()
+    ? safeStorage.encryptString(raw).toString('base64')
+    : Buffer.from(raw).toString('base64');
+  store.set(storeKey, enc as any);
+}
+
+const KEY_PATCH_FIELDS = ['openaiKey', 'groqKey', 'openrouterKey', 'customKey'] as const;
+
+ipcMain.handle('settings:set', (_e, patch: Partial<Settings & { openaiKey: string; groqKey: string; openrouterKey: string; customKey: string }>) => {
   try {
-    if (patch.openaiKey !== undefined) {
-      if (patch.openaiKey === '') {
-        store.set('openaiKeyEncrypted', '');
-      } else {
-        const enc = safeStorage.isEncryptionAvailable()
-          ? safeStorage.encryptString(patch.openaiKey).toString('base64')
-          : Buffer.from(patch.openaiKey).toString('base64');
-        store.set('openaiKeyEncrypted', enc);
-      }
-      delete (patch as any).openaiKey;
-    }
-    if ((patch as any).groqKey !== undefined) {
-      if ((patch as any).groqKey === '') {
-        store.set('groqKeyEncrypted', '');
-      } else {
-        const enc = safeStorage.isEncryptionAvailable()
-          ? safeStorage.encryptString((patch as any).groqKey).toString('base64')
-          : Buffer.from((patch as any).groqKey).toString('base64');
-        store.set('groqKeyEncrypted', enc);
-      }
-      delete (patch as any).groqKey;
-    }
+    if (patch.openaiKey     !== undefined) { persistEncryptedKey('openaiKeyEncrypted',     patch.openaiKey);     delete (patch as any).openaiKey; }
+    if (patch.groqKey       !== undefined) { persistEncryptedKey('groqKeyEncrypted',       patch.groqKey);       delete (patch as any).groqKey; }
+    if (patch.openrouterKey !== undefined) { persistEncryptedKey('openrouterKeyEncrypted', patch.openrouterKey); delete (patch as any).openrouterKey; }
+    if (patch.customKey     !== undefined) { persistEncryptedKey('customKeyEncrypted',     patch.customKey);     delete (patch as any).customKey; }
     // Non-key fields update the in-memory cache and sync to BizGrowHub.
     for (const [k, v] of Object.entries(patch)) {
-      if (v !== undefined && k !== 'openaiKey' && k !== 'groqKey') {
+      if (v !== undefined && !(KEY_PATCH_FIELDS as readonly string[]).includes(k)) {
         (S as Record<string, unknown>)[k] = v;
       }
     }
@@ -990,9 +1017,14 @@ ipcMain.handle('transcribe', async (_e, audioBase64: string, durationMs: number 
       audioBase64,
       apiKey: getApiKey(),
       groqKey: getGroqKey(),
+      openrouterKey: getOpenrouterKey(),
+      customKey: getCustomKey(),
+      customBaseUrl: S.customBaseUrl,
+      customHeaders: S.customHeaders,
       inputLang,
       outputLang,
-      gptModel,
+      gptModel: S.gptProvider === 'custom' ? (S.customChatModel || gptModel) : gptModel,
+      gptProvider: S.gptProvider,
       sttModel,
       sttProvider,
       skipGpt,
@@ -1034,27 +1066,28 @@ function applyDictionary(text: string): string {
   return out;
 }
 
-function getApiKey(): string {
-  const enc = store.get('openaiKeyEncrypted');
+function decryptStoredKey(storeKey: keyof Settings): string {
+  const enc = store.get(storeKey) as string;
   if (!enc) return '';
   return safeStorage.isEncryptionAvailable()
     ? safeStorage.decryptString(Buffer.from(enc, 'base64'))
     : Buffer.from(enc, 'base64').toString();
 }
 
-function getGroqKey(): string {
-  const enc = store.get('groqKeyEncrypted');
-  if (!enc) return '';
-  return safeStorage.isEncryptionAvailable()
-    ? safeStorage.decryptString(Buffer.from(enc, 'base64'))
-    : Buffer.from(enc, 'base64').toString();
-}
+function getApiKey():        string { return decryptStoredKey('openaiKeyEncrypted'); }
+function getGroqKey():       string { return decryptStoredKey('groqKeyEncrypted'); }
+function getOpenrouterKey(): string { return decryptStoredKey('openrouterKeyEncrypted'); }
+function getCustomKey():     string { return decryptStoredKey('customKeyEncrypted'); }
 
-// -- Universal text typing --
-// Types characters directly via Win32 SendInput with KEYEVENTF_UNICODE.
-// Works in any focused window (terminals included) without using the
-// clipboard or relying on Ctrl+V interpretation. A long-running PowerShell
-// helper hosts the C# typer so each paste skips PS startup cost.
+// -- Text injection helper (Windows) --
+// Two strategies, both via Win32 SendInput:
+//   PASTE  → clipboard already populated by Node; PS sends Ctrl+V (or
+//            Ctrl+Shift+V for terminals it detects). INSTANT for any text
+//            length — the apps process one shortcut, not N character events.
+//   TYPE   → fallback that types characters one-by-one with KEYEVENTF_UNICODE.
+//            Slow but works when paste-shortcut isn't supported.
+// A long-running PowerShell process hosts the helper so each invocation
+// skips PowerShell+Add-Type startup cost.
 const TYPE_SCRIPT_PATH = join(app.getPath('temp'), 'bizvoice-type.ps1');
 
 const TYPE_PS_SCRIPT = [
@@ -1064,6 +1097,7 @@ const TYPE_PS_SCRIPT = [
   'Add-Type -TypeDefinition @"',
   'using System;',
   'using System.Runtime.InteropServices;',
+  'using System.Text;',
   'using System.Threading;',
   '',
   'public static class Typer {',
@@ -1087,17 +1121,56 @@ const TYPE_PS_SCRIPT = [
   '    public struct HARDWAREINPUT { public uint uMsg; public ushort wParamL; public ushort wParamH; }',
   '',
   '    [DllImport("user32.dll", SetLastError = true)] public static extern uint SendInput(uint n, INPUT[] inputs, int cbSize);',
+  '    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();',
+  '    [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);',
   '',
   '    public const int INPUT_KEYBOARD = 1;',
   '    public const uint KEYEVENTF_KEYUP = 0x0002;',
   '    public const uint KEYEVENTF_UNICODE = 0x0004;',
-  '    public const ushort VK_RETURN = 0x0D;',
+  '    public const ushort VK_RETURN  = 0x0D;',
+  '    public const ushort VK_CONTROL = 0x11;',
+  '    public const ushort VK_SHIFT   = 0x10;',
+  '    public const ushort VK_V       = 0x56;',
   '',
-  '    // Small inter-key delay (ms). Terminals (conhost, Windows Terminal) drop',
-  '    // or merge keystrokes when SendInput floods their input buffer too fast,',
-  '    // so we throttle just enough to stay reliable without feeling slow.',
-  '    public const int KEY_DELAY_MS = 3;',
+  '    public const int KEY_DELAY_MS = 3;  // for the TYPE fallback only',
   '',
+  '    // Single-shortcut paste — auto-detects terminals and uses Ctrl+Shift+V there.',
+  '    public static void Paste() {',
+  '        var sb = new StringBuilder(256);',
+  '        GetClassName(GetForegroundWindow(), sb, sb.Capacity);',
+  '        string cls = sb.ToString();',
+  '        bool useShift = IsTerminal(cls);',
+  '        int n = useShift ? 6 : 4;',
+  '        INPUT[] inputs = new INPUT[n];',
+  '        int i = 0;',
+  '        inputs[i++] = MakeVkInput(VK_CONTROL, false);',
+  '        if (useShift) inputs[i++] = MakeVkInput(VK_SHIFT, false);',
+  '        inputs[i++] = MakeVkInput(VK_V, false);',
+  '        inputs[i++] = MakeVkInput(VK_V, true);',
+  '        if (useShift) inputs[i++] = MakeVkInput(VK_SHIFT, true);',
+  '        inputs[i++] = MakeVkInput(VK_CONTROL, true);',
+  '        SendInput((uint)n, inputs, Marshal.SizeOf(typeof(INPUT)));',
+  '    }',
+  '',
+  '    static bool IsTerminal(string cls) {',
+  '        if (string.IsNullOrEmpty(cls)) return false;',
+  '        if (cls == "CASCADIA_HOSTING_WINDOW_CLASS") return true;  // Windows Terminal',
+  '        if (cls == "ConsoleWindowClass") return true;             // legacy conhost (cmd/PowerShell)',
+  '        if (cls == "mintty") return true;                         // Git Bash / Cygwin',
+  '        if (cls.IndexOf("Console",  StringComparison.OrdinalIgnoreCase) >= 0) return true;',
+  '        if (cls.IndexOf("Terminal", StringComparison.OrdinalIgnoreCase) >= 0) return true;',
+  '        return false;',
+  '    }',
+  '',
+  '    static INPUT MakeVkInput(ushort vk, bool keyUp) {',
+  '        INPUT inp = new INPUT();',
+  '        inp.type = INPUT_KEYBOARD;',
+  '        inp.U.ki.wVk = vk;',
+  '        if (keyUp) inp.U.ki.dwFlags = KEYEVENTF_KEYUP;',
+  '        return inp;',
+  '    }',
+  '',
+  '    // Fallback: type characters one-by-one (KEYEVENTF_UNICODE).',
   '    public static void Type(string text) {',
   '        foreach (char c in text) {',
   "            if (c == '\\r') { continue; }",
@@ -1135,9 +1208,14 @@ const TYPE_PS_SCRIPT = [
   'while (($line = [Console]::In.ReadLine()) -ne $null) {',
   '    try {',
   '        if ([string]::IsNullOrEmpty($line)) { continue }',
-  '        $bytes = [Convert]::FromBase64String($line)',
-  '        $text = [Text.Encoding]::UTF8.GetString($bytes)',
-  '        [Typer]::Type($text)',
+  "        if ($line -eq 'PASTE') {",
+  '            [Typer]::Paste()',
+  "        } elseif ($line.StartsWith('TYPE:')) {",
+  '            $b64 = $line.Substring(5)',
+  '            $bytes = [Convert]::FromBase64String($b64)',
+  '            $text = [Text.Encoding]::UTF8.GetString($bytes)',
+  '            [Typer]::Type($text)',
+  '        }',
   '    } catch {',
   '        # ignore line errors so the worker keeps running',
   '    }',
@@ -1172,8 +1250,17 @@ function pasteWindows(text: string) {
     logEvent('error', 'type proc not available');
     return;
   }
-  const b64 = Buffer.from(text, 'utf-8').toString('base64');
-  typeProc.stdin.write(b64 + '\n');
+  // Fast path: stage text on the clipboard, then have the helper send a
+  // single Ctrl+V (or Ctrl+Shift+V for detected terminal windows). One
+  // shortcut keystroke regardless of text length → instant for the user.
+  const prev = clipboard.readText();
+  clipboard.writeText(text);
+  // Small settle delay so the target app sees the new clipboard contents
+  // before the shortcut fires; 50ms is below human perception.
+  setTimeout(() => { typeProc?.stdin?.write('PASTE\n'); }, 50);
+  // Restore the original clipboard once the paste has landed. Long enough
+  // for big pastes; the target's already consumed the text by then.
+  setTimeout(() => { try { clipboard.writeText(prev); } catch {} }, 1200);
 }
 
 // macOS: Cmd+V works in Terminal.app, iTerm2, VS Code terminal, and every app —

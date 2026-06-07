@@ -125,7 +125,17 @@ export function Settings() {
   const [whisperModels, setWhisperModels] = useState<{ name: string; size: string; downloaded: boolean }[]>([]);
   const [downloading, setDownloading] = useState<string | null>(null);
   const [downloadPct, setDownloadPct] = useState(0);
-  const [sttProvider, setSttProvider] = useState<'openai' | 'groq'>('openai');
+  // sttProvider value isn't read in this component — the unified picker drives
+  // gptProvider, and sttProvider is set as a derived backend hint via setSttProvider.
+  const [, setSttProvider] = useState<'openai' | 'groq'>('openai');
+  const [gptProvider, setGptProvider] = useState<'openai' | 'groq' | 'openrouter' | 'custom'>('openai');
+  const [openrouterKey, setOpenrouterKey] = useState('');
+  const [hasOpenrouterKey, setHasOpenrouterKey] = useState(false);
+  const [customKey, setCustomKey] = useState('');
+  const [hasCustomKey, setHasCustomKey] = useState(false);
+  const [customBaseUrl, setCustomBaseUrl] = useState('');
+  const [customChatModel, setCustomChatModel] = useState('');
+  const [customHeaders, setCustomHeaders] = useState('');
   const [skipGpt, setSkipGpt] = useState(false);
   const [muteWhileRecording, setMuteWhileRecording] = useState(false);
   const [dictionary, setDictionary] = useState<DictEntry[]>([]);
@@ -200,6 +210,14 @@ export function Settings() {
       setUseLocalWhisper(s.useLocalWhisper ?? false);
       setLocalModel(s.localModel || 'base');
       setSttProvider(s.sttProvider || 'openai');
+      setGptProvider(s.gptProvider || 'openai');
+      setCustomBaseUrl(s.customBaseUrl || '');
+      setCustomChatModel(s.customChatModel || '');
+      setCustomHeaders(s.customHeaders || '');
+      setHasOpenrouterKey(!!s.hasOpenrouterKey);
+      if (s.hasOpenrouterKey) setOpenrouterKey('••••••••••••••••••••');
+      setHasCustomKey(!!s.hasCustomKey);
+      if (s.hasCustomKey) setCustomKey('••••••••••••••••••••');
       setSkipGpt(s.skipGpt ?? false);
       setMuteWhileRecording(s.muteWhileRecording ?? false);
       setDictionary(s.dictionary || []);
@@ -318,6 +336,18 @@ export function Settings() {
     if (!t || t.startsWith('•')) { flash('err', 'Please enter a key'); return; }
     await save({ groqKey: t } as any, 'Groq key saved');
     setHasGroqKey(true); setGroqKey('••••••••••••••••••••');
+  }
+  async function saveOpenrouterKey() {
+    const t = openrouterKey.trim();
+    if (!t || t.startsWith('•')) { flash('err', 'Please enter a key'); return; }
+    await save({ openrouterKey: t } as any, 'OpenRouter key saved');
+    setHasOpenrouterKey(true); setOpenrouterKey('••••••••••••••••••••');
+  }
+  async function saveCustomKey() {
+    const t = customKey.trim();
+    if (!t || t.startsWith('•')) { flash('err', 'Please enter a key'); return; }
+    await save({ customKey: t } as any, 'Custom key saved');
+    setHasCustomKey(true); setCustomKey('••••••••••••••••••••');
   }
   function flash(kind: 'ok' | 'err', msg: string) {
     setToast({ kind, msg });
@@ -541,59 +571,150 @@ export function Settings() {
                 </Card>
               )}
 
-              {/* CLOUD settings */}
+              {/* CLOUD settings — one provider picker, used for STT + AI Formatting + Refine.
+                  STT-only-capable providers (OpenRouter, Custom) auto-fall back to
+                  whatever OpenAI/Groq key is set for the Whisper step. */}
               {!useLocalWhisper && (
                 <>
                   <Card>
                     <Label>Provider</Label>
-                    <HelpText>Groq is 10-20x faster than OpenAI. Free tier at console.groq.com</HelpText>
-                    <div className="flex gap-2 mt-1">
-                      {(['openai', 'groq'] as const).map((p) => (
-                        <button key={p} onClick={() => { setSttProvider(p); save({ sttProvider: p }, `Provider: ${p}`); }}
-                          className={`flex-1 px-3 py-2 rounded-md text-xs font-semibold border transition-all ${
-                            sttProvider === p
-                              ? (p === 'groq' ? 'bg-orange-600 border-orange-500 text-white' : 'bg-blue-600 border-blue-500 text-white')
-                              : 'bg-[#1f1f28] border-white/10 text-white/60 hover:text-white'
-                          }`}>{p === 'openai' ? 'OpenAI' : 'Groq (Fast)'}</button>
-                      ))}
+                    <HelpText>One provider powers transcription, AI formatting, and refine. OpenRouter & Custom are chat-only — STT falls back to your OpenAI or Groq key.</HelpText>
+                    <div className="grid grid-cols-4 gap-2 mt-1">
+                      {(['openai', 'groq', 'openrouter', 'custom'] as const).map((p) => {
+                        const active = gptProvider === p;
+                        const accent = p === 'groq'
+                          ? 'bg-orange-600 border-orange-500 text-white'
+                          : p === 'openrouter'
+                          ? 'bg-purple-600 border-purple-500 text-white'
+                          : p === 'custom'
+                          ? 'bg-slate-600 border-slate-500 text-white'
+                          : 'bg-blue-600 border-blue-500 text-white';
+                        const label = p === 'openai' ? 'OpenAI' : p === 'groq' ? 'Groq' : p === 'openrouter' ? 'OpenRouter' : 'Custom';
+                        return (
+                          <button key={p}
+                            onClick={() => {
+                              setGptProvider(p);
+                              // Whisper-capable providers sync sttProvider too. Chat-only
+                              // ones (openrouter/custom) leave sttProvider as a Whisper fallback.
+                              if (p === 'openai' || p === 'groq') {
+                                setSttProvider(p);
+                                save({ gptProvider: p, sttProvider: p }, `Provider: ${label}`);
+                              } else {
+                                save({ gptProvider: p }, `Provider: ${label}`);
+                              }
+                            }}
+                            className={`px-2 py-2 rounded-md text-[12px] font-semibold border transition-all ${
+                              active ? accent : 'bg-[#1f1f28] border-white/10 text-white/60 hover:text-white'
+                            }`}>{label}</button>
+                        );
+                      })}
                     </div>
                   </Card>
 
-                  {sttProvider === 'openai' ? (
-                    <KeyCard label="OpenAI API Key" has={hasKey} val={apiKey} setVal={setApiKey} onSave={saveApiKey} prefix="sk-"
-                      onChange={() => setApiKey('')} onRemove={() => { save({ openaiKey: '' } as any, 'Key removed'); setHasKey(false); setApiKey(''); }} />
-                  ) : (
+                  {/* OpenAI: API key + STT model picker (Whisper variants) */}
+                  {gptProvider === 'openai' && (
+                    <>
+                      <KeyCard label="OpenAI API Key" has={hasKey} val={apiKey} setVal={setApiKey} onSave={saveApiKey} prefix="sk-"
+                        onChange={() => setApiKey('')} onRemove={() => { save({ openaiKey: '' } as any, 'Key removed'); setHasKey(false); setApiKey(''); }} />
+                      <Card>
+                        <Label>Transcription Model</Label>
+                        <Select
+                          value={sttModel}
+                          onChange={(v) => { setSttModel(v); save({ sttModel: v }); }}
+                          options={[
+                            { value: 'gpt-4o-mini-transcribe', label: 'gpt-4o-mini-transcribe — fast' },
+                            { value: 'gpt-4o-transcribe',      label: 'gpt-4o-transcribe — best accuracy' },
+                            { value: 'whisper-1',              label: 'whisper-1 — legacy' },
+                          ]}
+                        />
+                      </Card>
+                    </>
+                  )}
+
+                  {/* Groq: API key only — one STT model (whisper-large-v3-turbo) */}
+                  {gptProvider === 'groq' && (
                     <KeyCard label="Groq API Key" has={hasGroqKey} val={groqKey} setVal={setGroqKey} onSave={saveGroqKey} prefix="gsk_"
                       onChange={() => setGroqKey('')} onRemove={() => { save({ groqKey: '' } as any, 'Key removed'); setHasGroqKey(false); setGroqKey(''); }} />
                   )}
 
-                  {sttProvider === 'openai' && (
-                    <Card>
-                      <Label>Transcription Model</Label>
-                      <Select
-                        value={sttModel}
-                        onChange={(v) => { setSttModel(v); save({ sttModel: v }); }}
-                        options={[
-                          { value: 'gpt-4o-mini-transcribe', label: 'gpt-4o-mini-transcribe — fast' },
-                          { value: 'gpt-4o-transcribe',      label: 'gpt-4o-transcribe — best accuracy' },
-                          { value: 'whisper-1',              label: 'whisper-1 — legacy' },
-                        ]}
-                      />
-                    </Card>
+                  {/* OpenRouter: key + chat model. STT silently falls back. */}
+                  {gptProvider === 'openrouter' && (
+                    <>
+                      <KeyCard label="OpenRouter API Key" has={hasOpenrouterKey} val={openrouterKey} setVal={setOpenrouterKey} onSave={saveOpenrouterKey} prefix="sk-or-"
+                        onChange={() => setOpenrouterKey('')}
+                        onRemove={() => { save({ openrouterKey: '' } as any, 'Key removed'); setHasOpenrouterKey(false); setOpenrouterKey(''); }} />
+                      <Card>
+                        <Label>Chat Model</Label>
+                        <HelpText>Find model IDs at openrouter.ai/models</HelpText>
+                        <input type="text" value={gptModel} onChange={(e) => setGptModel(e.target.value)} onBlur={() => save({ gptModel })}
+                          placeholder="e.g. meta-llama/llama-3.1-8b-instruct"
+                          className={inputCls} />
+                      </Card>
+                      {!hasKey && !hasGroqKey && (
+                        <div className="text-[11px] text-amber-400 bg-amber-500/5 rounded-lg px-3 py-2 border border-amber-500/20">
+                          OpenRouter doesn't transcribe audio. Add an OpenAI or Groq key (in their tab) for STT fallback, or switch to Local mode.
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                  {/* Custom: full config */}
+                  {gptProvider === 'custom' && (
+                    <>
+                      <KeyCard label="Custom API Key" has={hasCustomKey} val={customKey} setVal={setCustomKey} onSave={saveCustomKey} prefix=""
+                        onChange={() => setCustomKey('')}
+                        onRemove={() => { save({ customKey: '' } as any, 'Key removed'); setHasCustomKey(false); setCustomKey(''); }} />
+                      <Card>
+                        <Label>Base URL</Label>
+                        <HelpText>OpenAI-compatible endpoint root (e.g. .../v1). The /chat/completions path is appended automatically.</HelpText>
+                        <input type="text" value={customBaseUrl} onChange={(e) => setCustomBaseUrl(e.target.value)} onBlur={() => save({ customBaseUrl })}
+                          placeholder="https://freellmapi.webdevarif.com/v1"
+                          className={inputCls} />
+                      </Card>
+                      <Card>
+                        <Label>Chat Model</Label>
+                        <input type="text" value={customChatModel} onChange={(e) => setCustomChatModel(e.target.value)} onBlur={() => save({ customChatModel })}
+                          placeholder="e.g. auto, gpt-4o-mini, llama-3.1-70b"
+                          className={inputCls} />
+                      </Card>
+                      <Card>
+                        <Label>Extra Headers (JSON, optional)</Label>
+                        <HelpText>For providers that need custom headers, e.g. HTTP-Referer. Leave blank if unsure.</HelpText>
+                        <textarea value={customHeaders} onChange={(e) => setCustomHeaders(e.target.value)} onBlur={() => save({ customHeaders })}
+                          placeholder='{"HTTP-Referer":"https://example.com"}'
+                          rows={2}
+                          className={inputCls + ' resize-none font-mono text-xs'} />
+                      </Card>
+                      {!hasKey && !hasGroqKey && (
+                        <div className="text-[11px] text-amber-400 bg-amber-500/5 rounded-lg px-3 py-2 border border-amber-500/20">
+                          Most custom proxies don't transcribe audio. Add an OpenAI or Groq key for STT fallback, or switch to Local mode.
+                        </div>
+                      )}
+                    </>
                   )}
                 </>
               )}
 
-              {/* AI Formatting (optional, needs OpenAI key) */}
+              {/* AI Formatting — single toggle. Uses whichever provider is set above
+                  (or any cloud-key fallback when Local mode is on). */}
               <Card>
                 <div className="flex items-center justify-between">
                   <div>
                     <Label>AI Formatting</Label>
-                    <HelpText>{skipGpt ? 'Off — pastes raw transcription instantly (fastest)' : 'On — GPT cleans up grammar & formatting'}</HelpText>
+                    <HelpText>
+                      {skipGpt
+                        ? 'Off — pastes raw transcription instantly (fastest)'
+                        : useLocalWhisper
+                        ? 'On — uses your cloud key (OpenAI/Groq/OpenRouter/Custom) for grammar cleanup'
+                        : `On — cleans up grammar & formatting via ${gptProvider === 'openrouter' ? 'OpenRouter' : gptProvider === 'custom' ? 'your custom endpoint' : gptProvider === 'groq' ? 'Groq' : 'OpenAI'}`}
+                    </HelpText>
                   </div>
                   <Toggle on={!skipGpt} onClick={() => { const v = !skipGpt; setSkipGpt(v); save({ skipGpt: v }, v ? 'Fast mode' : 'AI formatting on'); }} />
                 </div>
-                {!skipGpt && (
+
+                {/* Quick model swap for built-in providers (OpenAI/Groq).
+                    OpenRouter/Custom set their model in the Provider config above. */}
+                {!skipGpt && !useLocalWhisper && gptProvider === 'openai' && (
                   <div className="mt-3">
                     <Select
                       value={gptModel}
@@ -601,6 +722,19 @@ export function Settings() {
                       options={[
                         { value: 'gpt-4o-mini', label: 'gpt-4o-mini — fast, cheap' },
                         { value: 'gpt-4o',      label: 'gpt-4o — best quality' },
+                      ]}
+                    />
+                  </div>
+                )}
+                {!skipGpt && !useLocalWhisper && gptProvider === 'groq' && (
+                  <div className="mt-3">
+                    <Select
+                      value={gptModel}
+                      onChange={(v) => { setGptModel(v); save({ gptModel: v }); }}
+                      options={[
+                        { value: 'llama-3.1-8b-instant',    label: 'llama-3.1-8b-instant — fastest' },
+                        { value: 'llama-3.3-70b-versatile', label: 'llama-3.3-70b-versatile — best quality' },
+                        { value: 'mixtral-8x7b-32768',      label: 'mixtral-8x7b — long context' },
                       ]}
                     />
                   </div>

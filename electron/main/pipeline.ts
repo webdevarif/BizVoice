@@ -18,6 +18,67 @@ function toISO639(lang: Lang): string | undefined {
   return LANG_TO_ISO[lang.toLowerCase()] ?? undefined;
 }
 
+// Construct the OpenAI-compatible client for the configured GPT provider.
+// Returns null when the chosen provider has no key (caller should skip GPT).
+function buildGptClient(opts: {
+  apiKey?: string;
+  groqKey?: string;
+  openrouterKey?: string;
+  customKey?: string;
+  customBaseUrl?: string;
+  customHeaders?: string;
+  gptModel: string;
+  gptProvider?: GptProvider;
+}): { client: OpenAI; model: string; providerLabel: string } | null {
+  const provider = opts.gptProvider ?? 'openai';
+  if (provider === 'groq') {
+    if (!opts.groqKey) return null;
+    return {
+      client: new OpenAI({ apiKey: opts.groqKey, baseURL: 'https://api.groq.com/openai/v1' }),
+      model: opts.gptModel,
+      providerLabel: 'Groq',
+    };
+  }
+  if (provider === 'openrouter') {
+    if (!opts.openrouterKey) return null;
+    return {
+      client: new OpenAI({
+        apiKey: opts.openrouterKey,
+        baseURL: 'https://openrouter.ai/api/v1',
+        defaultHeaders: {
+          'HTTP-Referer': 'https://github.com/webdevarif/BizVoice',
+          'X-Title': 'BizVoice',
+        },
+      }),
+      model: opts.gptModel,
+      providerLabel: 'OpenRouter',
+    };
+  }
+  if (provider === 'custom') {
+    if (!opts.customKey || !opts.customBaseUrl) return null;
+    let extraHeaders: Record<string, string> = {};
+    if (opts.customHeaders) {
+      try { extraHeaders = JSON.parse(opts.customHeaders); } catch { /* ignore bad JSON */ }
+    }
+    return {
+      client: new OpenAI({
+        apiKey: opts.customKey,
+        baseURL: opts.customBaseUrl,
+        defaultHeaders: extraHeaders,
+      }),
+      model: opts.gptModel,
+      providerLabel: 'Custom',
+    };
+  }
+  // Default: OpenAI
+  if (!opts.apiKey) return null;
+  return {
+    client: new OpenAI({ apiKey: opts.apiKey }),
+    model: opts.gptModel,
+    providerLabel: 'OpenAI',
+  };
+}
+
 function languageInstruction(inputLang: Lang, outputLang: Lang): string {
   if (outputLang && outputLang !== 'auto') {
     const inLbl = inputLang && inputLang !== 'auto' ? inputLang : 'the detected input language';
@@ -26,13 +87,20 @@ function languageInstruction(inputLang: Lang, outputLang: Lang): string {
   return `Keep the output in the SAME language as the input.`;
 }
 
+export type GptProvider = 'openai' | 'groq' | 'openrouter' | 'custom';
+
 export async function runPipeline(opts: {
   audioBase64: string;
   apiKey: string;
   groqKey?: string;
+  openrouterKey?: string;
+  customKey?: string;
+  customBaseUrl?: string;
+  customHeaders?: string;  // JSON string
   inputLang: Lang;
   outputLang: Lang;
   gptModel: string;
+  gptProvider?: GptProvider;
   sttModel: string;
   sttProvider?: 'openai' | 'groq';
   skipGpt?: boolean;
@@ -116,15 +184,16 @@ export async function runPipeline(opts: {
     }
 
     // ── GPT formatting ──
-    if (!opts.apiKey) return raw;
-    const openai = new OpenAI({ apiKey: opts.apiKey });
+    const gptClient = buildGptClient(opts);
+    if (!gptClient) return raw;  // no usable provider/key configured
+    const { client, model, providerLabel } = gptClient;
     const systemPrompt = `${opts.styleSystemPrompt}\n\n${languageInstruction(opts.inputLang, opts.outputLang)}`;
 
-    log(`calling GPT (${opts.gptModel})...`);
+    log(`calling GPT via ${providerLabel} (${model})...`);
     const gptAbort = AbortSignal.timeout(GPT_TIMEOUT);
-    const completion = await openai.chat.completions.create(
+    const completion = await client.chat.completions.create(
       {
-        model: opts.gptModel,
+        model,
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: raw },
