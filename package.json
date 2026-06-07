@@ -1,6 +1,6 @@
 {
   "name": "bizvoice",
-  "version": "0.1.10",
+  "version": "0.1.13",
   "description": "AI voice typing for Windows — Whisper + GPT powered, works in any app",
   "main": "dist-electron/main/index.js",
   "author": "BizVoice",
@@ -56,9 +56,14 @@
       "output": "release/${version}"
     },
     "compression": "maximum",
+    "electronLanguages": [
+      "en-US"
+    ],
     "files": [
       "dist/**",
       "dist-electron/**",
+      "!dist/vad/ort-wasm-simd-threaded.asyncify.wasm",
+      "!dist/vad/ort-wasm-simd-threaded.asyncify.mjs",
       "!node_modules/onnxruntime-web/**",
       "!node_modules/@hugeicons/**",
       "!node_modules/@fugood/node-whisper-win32-x64-cuda/**",
