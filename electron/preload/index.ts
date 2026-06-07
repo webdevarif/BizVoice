@@ -61,7 +61,7 @@ contextBridge.exposeInMainWorld('api', {
     return () => { ipcRenderer.removeListener('auth:changed', handler); };
   },
   // App updates (GitHub Releases via electron-updater)
-  updateInfo: () => ipcRenderer.invoke('update:info'),
+  updateInfo: (forceCheck?: boolean) => ipcRenderer.invoke('update:info', forceCheck),
   updateDownload: () => ipcRenderer.invoke('update:download'),
   updateInstall: () => ipcRenderer.invoke('update:install'),
   updateLater: () => ipcRenderer.invoke('update:later'),
@@ -112,7 +112,7 @@ declare global {
       openSubscribe: () => Promise<void>;
       openRegister: () => Promise<void>;
       onAuthChange: (cb: (data: { active: boolean; loggedIn: boolean; email: string }) => void) => () => void;
-      updateInfo: () => Promise<{ current: string; latest: { version: string; notes?: string[]; releasedAt?: string } | null; updateAvailable: boolean; downloaded: boolean }>;
+      updateInfo: (forceCheck?: boolean) => Promise<{ current: string; latest: { version: string; notes?: string[]; releasedAt?: string } | null; updateAvailable: boolean; downloaded: boolean }>;
       updateDownload: () => Promise<void>;
       updateInstall: () => Promise<void>;
       updateLater: () => Promise<void>;

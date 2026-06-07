@@ -1,6 +1,6 @@
 {
   "name": "bizvoice",
-  "version": "0.1.15",
+  "version": "0.1.16",
   "description": "AI voice typing for Windows — Whisper + GPT powered, works in any app",
   "main": "dist-electron/main/index.js",
   "author": "BizVoice",
@@ -8,7 +8,7 @@
   "scripts": {
     "dev": "vite",
     "build": "npm version patch --no-git-tag-version && vite build && electron-builder && node scripts/publish-to-bizgrowhub.mjs",
-    "release": "npm version patch --no-git-tag-version && vite build && electron-builder --publish always && node scripts/publish-to-bizgrowhub.mjs",
+    "release": "node scripts/release.mjs",
     "preview": "vite preview",
     "start": "electron ."
   },

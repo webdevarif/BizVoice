@@ -143,7 +143,7 @@ export function Settings() {
   const [editingDict, setEditingDict] = useState<number | null>(null);
   const [toast, setToast] = useState<{ kind: 'ok' | 'err'; msg: string } | null>(null);
   const [auth, setAuth] = useState<{ loggedIn: boolean; active: boolean; email: string; offline?: boolean }>({ loggedIn: false, active: false, email: '' });
-  const [upd, setUpd] = useState<{ current: string; latest: { version: string } | null; updateAvailable: boolean } | null>(null);
+  const [upd, setUpd] = useState<{ current: string; latest: { version: string; notes?: string[]; releasedAt?: string } | null; updateAvailable: boolean; downloaded: boolean } | null>(null);
   const [checking, setChecking] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -171,13 +171,16 @@ export function Settings() {
     return off;
   }, []);
 
-  // App version + live update check (About tab)
-  async function checkUpdates() {
+  // App version + live update check (About tab).
+  // First mount pulls cached state instantly so the version + "checking…"
+  // both render right away; the button below triggers a fresh GitHub query.
+  async function checkUpdates(force = true) {
     setChecking(true);
-    try { setUpd(await window.api.updateInfo()); } catch { /* offline */ }
+    try { setUpd(await window.api.updateInfo(force)); } catch { /* offline */ }
     setChecking(false);
   }
-  useEffect(() => { void checkUpdates(); }, []);
+  useEffect(() => { void checkUpdates(false); }, []);
+  useEffect(() => { if (tab === 'about') void checkUpdates(true); }, [tab]);
 
   const LEGACY_LANG_MAP: Record<string, string> = { en: 'English', bn: 'Bangla' };
   const normalizeLang = (v: string) => LEGACY_LANG_MAP[v] ?? v ?? 'auto';
@@ -934,26 +937,51 @@ export function Settings() {
                   <div className="text-sm text-white/60 mt-4 leading-relaxed text-center max-w-sm">AI voice typing for Windows. Press your hotkey anywhere to dictate into any app.</div>
 
                   {/* Updates */}
-                  <div className="mt-5 flex flex-col items-center gap-2">
-                    {upd?.updateAvailable ? (
+                  <div className="mt-5 flex flex-col items-center gap-2 w-full max-w-sm">
+                    {checking ? (
+                      <div className="text-[11px] text-white/50 flex items-center gap-2">
+                        <span className="inline-block w-3 h-3 border-2 border-white/20 border-t-blue-400 rounded-full animate-spin" />
+                        Checking GitHub for updates…
+                      </div>
+                    ) : upd?.updateAvailable && upd.latest ? (
                       <>
-                        <div className="text-xs font-medium text-blue-400">A new version is available — v{upd.latest?.version}</div>
+                        <div className="text-xs font-medium text-blue-400 text-center">
+                          New version available: v{upd.latest.version}
+                        </div>
+                        <div className="text-[10px] text-white/40">
+                          You&apos;re on v{upd.current}
+                        </div>
+                        {upd.downloaded ? (
+                          <button
+                            onClick={() => window.api.updateInstall()}
+                            className="mt-1 px-4 py-2 rounded-md text-xs font-semibold bg-green-600 hover:bg-green-500 text-white transition-colors"
+                          >
+                            Restart to install
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => window.api.updateDownload()}
+                            className="mt-1 px-4 py-2 rounded-md text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white transition-colors"
+                          >
+                            Download &amp; update
+                          </button>
+                        )}
                         <button
-                          onClick={() => window.api.updateDownload()}
-                          className="px-4 py-2 rounded-md text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white transition-colors"
+                          onClick={() => checkUpdates(true)}
+                          className="text-[10px] text-white/40 hover:text-white/70 transition-colors"
                         >
-                          Download &amp; update
+                          Re-check
                         </button>
                       </>
                     ) : (
                       <>
                         {upd && <div className="text-[11px] text-green-400/80">You&apos;re on the latest version.</div>}
                         <button
-                          onClick={checkUpdates}
+                          onClick={() => checkUpdates(true)}
                           disabled={checking}
                           className="px-4 py-2 rounded-md text-xs font-medium bg-white/5 hover:bg-white/10 border border-white/10 text-white/70 transition-colors disabled:opacity-50"
                         >
-                          {checking ? 'Checking…' : 'Check for updates'}
+                          Check for updates
                         </button>
                       </>
                     )}

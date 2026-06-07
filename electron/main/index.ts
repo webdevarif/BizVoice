@@ -536,12 +536,22 @@ async function checkForUpdate() {
   catch (err: any) { logEvent('warn', 'update check threw', { error: err?.message }); }
 }
 
-ipcMain.handle('update:info', () => ({
-  current: app.getVersion(),
-  latest: latestUpdate,
-  updateAvailable: !!latestUpdate,
-  downloaded: updateDownloaded,
-}));
+ipcMain.handle('update:info', async (_e, forceCheck?: boolean) => {
+  // About page passes forceCheck=true so the user-facing "Check for updates"
+  // button reflects a live GitHub query, not stale cached state. The popup
+  // (Update.tsx) doesn't need it — it only opens after an update-available
+  // event fires, so latestUpdate is already populated.
+  if (forceCheck && app.isPackaged) {
+    try { await autoUpdater.checkForUpdates(); }
+    catch (err: any) { logEvent('warn', 'forced update check failed', { error: err?.message }); }
+  }
+  return {
+    current: app.getVersion(),
+    latest: latestUpdate,
+    updateAvailable: !!latestUpdate,
+    downloaded: updateDownloaded,
+  };
+});
 ipcMain.handle('update:download', async () => {
   try { await autoUpdater.downloadUpdate(); }
   catch (err: any) { logEvent('error', 'update download failed', { error: err?.message }); }
