@@ -472,18 +472,32 @@ autoUpdater.logger = {
   debug: () => {},
 } as any;
 
+// GitHub returns release notes as Markdown-rendered HTML, not raw text —
+// convert <p>/<br>/<li>/etc. into line breaks, strip any remaining tags,
+// decode common HTML entities, and return a clean array of bullet lines.
 function parseReleaseNotes(notes: unknown): string[] {
   if (!notes) return [];
-  if (typeof notes === 'string') {
-    return notes
-      .split('\n')
-      .map((l) => l.trim().replace(/^[-*+]\s*/, ''))
-      .filter((l) => l.length > 0);
-  }
-  if (Array.isArray(notes)) {
-    return notes.map((n: any) => (typeof n === 'string' ? n : n?.note ?? '')).filter(Boolean);
-  }
-  return [];
+  let raw: string;
+  if (typeof notes === 'string') raw = notes;
+  else if (Array.isArray(notes)) raw = notes.map((n: any) => (typeof n === 'string' ? n : n?.note ?? '')).join('\n');
+  else return [];
+
+  const cleaned = raw
+    .replace(/<\/p>\s*<p[^>]*>/gi, '\n\n')                     // paragraph break
+    .replace(/<br\s*\/?>/gi, '\n')                              // <br>
+    .replace(/<\/?(p|div|li|section|article|h[1-6])[^>]*>/gi, '\n')  // block tags
+    .replace(/<[^>]+>/g, '')                                    // strip remaining tags
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ');
+
+  return cleaned
+    .split(/\n+/)
+    .map((l) => l.trim().replace(/^[-*+]\s*/, ''))
+    .filter((l) => l.length > 0);
 }
 
 autoUpdater.on('update-available', (info) => {
