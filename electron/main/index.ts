@@ -1166,7 +1166,7 @@ const TYPE_PS_SCRIPT = [
   '        SendInput((uint)n, inputs, Marshal.SizeOf(typeof(INPUT)));',
   '    }',
   '',
-  '    static bool IsTerminal(string cls) {',
+  '    public static bool IsTerminal(string cls) {',
   '        if (string.IsNullOrEmpty(cls)) return false;',
   '        if (cls == "CASCADIA_HOSTING_WINDOW_CLASS") return true;  // Windows Terminal',
   '        if (cls == "ConsoleWindowClass") return true;             // legacy conhost (cmd/PowerShell)',
@@ -1174,6 +1174,12 @@ const TYPE_PS_SCRIPT = [
   '        if (cls.IndexOf("Console",  StringComparison.OrdinalIgnoreCase) >= 0) return true;',
   '        if (cls.IndexOf("Terminal", StringComparison.OrdinalIgnoreCase) >= 0) return true;',
   '        return false;',
+  '    }',
+  '',
+  '    public static bool IsTerminalNow() {',
+  '        var sb = new StringBuilder(256);',
+  '        GetClassName(GetForegroundWindow(), sb, sb.Capacity);',
+  '        return IsTerminal(sb.ToString());',
   '    }',
   '',
   '    static INPUT MakeVkInput(ushort vk, bool keyUp) {',
@@ -1229,6 +1235,19 @@ const TYPE_PS_SCRIPT = [
   '            $bytes = [Convert]::FromBase64String($b64)',
   '            $text = [Text.Encoding]::UTF8.GetString($bytes)',
   '            [Typer]::Type($text)',
+  "        } elseif ($line.StartsWith('SMART:')) {",
+  '            # PS-side decision: terminals (incl. TUIs like Claude Code, vim,',
+  '            # tmux) get character typing so the TUI sees real key events',
+  '            # instead of an intercepted paste shortcut. Everything else gets',
+  '            # the instant clipboard-paste shortcut.',
+  '            $b64 = $line.Substring(6)',
+  '            $bytes = [Convert]::FromBase64String($b64)',
+  '            $text = [Text.Encoding]::UTF8.GetString($bytes)',
+  '            if ([Typer]::IsTerminalNow()) {',
+  '                [Typer]::Type($text)',
+  '            } else {',
+  '                [Typer]::Paste()',
+  '            }',
   '        }',
   '    } catch {',
   '        # ignore line errors so the worker keeps running',
@@ -1264,17 +1283,18 @@ function pasteWindows(text: string) {
     logEvent('error', 'type proc not available');
     return;
   }
-  // Fast path: stage text on the clipboard, then have the helper send a
-  // single Ctrl+V (or Ctrl+Shift+V for detected terminal windows). One
-  // shortcut keystroke regardless of text length → instant for the user.
+  // SMART: helper inspects the foreground window. Terminal windows get
+  // character-typed (works in TUIs like Claude Code / vim / tmux that
+  // intercept Ctrl+V for their own purposes). Everything else gets the
+  // instant clipboard-paste shortcut. Clipboard is staged either way so
+  // the paste branch has data ready.
   const prev = clipboard.readText();
   clipboard.writeText(text);
-  // Small settle delay so the target app sees the new clipboard contents
-  // before the shortcut fires; 50ms is below human perception.
-  setTimeout(() => { typeProc?.stdin?.write('PASTE\n'); }, 50);
-  // Restore the original clipboard once the paste has landed. Long enough
-  // for big pastes; the target's already consumed the text by then.
-  setTimeout(() => { try { clipboard.writeText(prev); } catch {} }, 1200);
+  const b64 = Buffer.from(text, 'utf-8').toString('base64');
+  setTimeout(() => { typeProc?.stdin?.write(`SMART:${b64}\n`); }, 50);
+  // Restore original clipboard once the paste/type has landed. Big terminals
+  // can take ~1s for long text via char-typing, so wait a bit longer.
+  setTimeout(() => { try { clipboard.writeText(prev); } catch {} }, 2000);
 }
 
 // macOS: Cmd+V works in Terminal.app, iTerm2, VS Code terminal, and every app —
