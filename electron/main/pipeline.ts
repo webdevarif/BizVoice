@@ -18,6 +18,34 @@ function toISO639(lang: Lang): string | undefined {
   return LANG_TO_ISO[lang.toLowerCase()] ?? undefined;
 }
 
+// Whisper accepts a free-text `prompt` parameter that biases recognition
+// toward similar style/vocabulary. For low-resource languages (Bangla,
+// Hindi, Urdu, etc.) Whisper's accuracy is poor by default; seeding the
+// prompt with a natural sample in the target language nudges the model
+// toward correct character shapes, conjunct consonants, and grammar.
+const LANG_SEEDS: Record<string, string> = {
+  bangla: 'নমস্কার, আমি বাংলায় কথা বলছি। প্রযুক্তি, কাজ, ব্যবসা, এবং দৈনন্দিন কথোপকথন নিয়ে কথা বলব।',
+  hindi:  'नमस्ते, मैं हिंदी में बात कर रहा हूँ। टेक्नोलॉजी, काम, व्यवसाय, और रोज़मर्रा की बातचीत के बारे में बोलूँगा।',
+  urdu:   'السلام علیکم، میں اردو میں بات کر رہا ہوں۔ ٹیکنالوجی، کام، اور روزمرہ کی گفتگو کے بارے میں۔',
+  arabic: 'مرحباً، أنا أتحدث بالعربية. سأتحدث عن التكنولوجيا والعمل والمحادثات اليومية.',
+  tamil:  'வணக்கம், நான் தமிழில் பேசுகிறேன். தொழில்நுட்பம், வேலை, மற்றும் தினசரி உரையாடல்கள் பற்றி பேசுவேன்.',
+};
+
+function langSeed(inputLang: Lang): string {
+  if (!inputLang || inputLang === 'auto') return '';
+  return LANG_SEEDS[inputLang.toLowerCase()] ?? '';
+}
+
+// Combine the user's custom vocabulary with a language seed (when applicable)
+// into a single Whisper `prompt` value. Order matters: the seed goes first so
+// the model anchors on the target language's character set before tuning to
+// domain terms.
+function buildPrompt(opts: { vocabulary?: string; inputLang: Lang }): string {
+  const seed  = langSeed(opts.inputLang);
+  const vocab = opts.vocabulary?.trim() ? `Domain vocabulary: ${opts.vocabulary.trim()}` : '';
+  return [seed, vocab].filter(Boolean).join(' ').trim();
+}
+
 // Construct the OpenAI-compatible client for the configured GPT provider.
 // Returns null when the chosen provider has no key (caller should skip GPT).
 function buildGptClient(opts: {
@@ -89,12 +117,66 @@ function languageInstruction(inputLang: Lang, outputLang: Lang): string {
 
 export type GptProvider = 'openai' | 'groq' | 'openrouter' | 'custom';
 
+// Better-Bangla path: BizVoice client POSTs the audio to the BizGrowHub
+// backend, which holds the developer's own HuggingFace token (or runs a
+// self-hosted Bangla ASR model) and returns the transcript. End users
+// never need an HF account or token of their own — works out of the box
+// for anyone with a valid BizGrowHub login.
+export function isBetterBanglaSupported(lang: Lang): boolean {
+  return !!lang && lang.toLowerCase() === 'bangla';
+}
+
+async function transcribeViaBizGrowHub(opts: {
+  bghBaseUrl: string;
+  bghToken: string;
+  audioPath: string;
+  inputLang: Lang;
+  log: (msg: string, data?: any) => void;
+}): Promise<string> {
+  const { bghBaseUrl, bghToken, audioPath, inputLang, log } = opts;
+  log(`calling BizGrowHub Bangla STT...`);
+
+  const { readFileSync } = await import('fs');
+  const audioBytes = readFileSync(audioPath);
+  // @ts-ignore — Node global Blob accepts Buffer
+  const blob = new Blob([audioBytes], { type: 'audio/wav' });
+  const form = new FormData();
+  form.append('file', blob, 'audio.wav');
+  form.append('language', inputLang.toLowerCase());
+
+  const doFetch = () =>
+    fetch(`${bghBaseUrl}/api/bizvoice/transcribe-indic`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${bghToken}` },
+      body: form as any,
+      signal: AbortSignal.timeout(60_000),
+    });
+
+  // The server may warm a HuggingFace model on first call — retry once on
+  // 503 with a short wait, then surface the error.
+  let res = await doFetch();
+  if (res.status === 503) {
+    log('bgh model warming up — waiting 6s and retrying once');
+    await new Promise((r) => setTimeout(r, 6000));
+    res = await doFetch();
+  }
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`BizGrowHub Bangla STT failed (${res.status}): ${errText.slice(0, 200)}`);
+  }
+  const data = await res.json().catch(() => ({} as any));
+  return String(data.transcript ?? data.text ?? '').trim();
+}
+
 export async function runPipeline(opts: {
   audioBase64: string;
   apiKey: string;
   groqKey?: string;
   openrouterKey?: string;
   customKey?: string;
+  useBetterBangla?: boolean;
+  bghBaseUrl?: string;
+  bghToken?: string;
   customBaseUrl?: string;
   customHeaders?: string;  // JSON string
   inputLang: Lang;
@@ -134,19 +216,34 @@ export async function runPipeline(opts: {
         language: toISO639(opts.inputLang),
         log: (msg) => log(msg),
       });
+    } else if (opts.useBetterBangla && opts.bghBaseUrl && opts.bghToken && isBetterBanglaSupported(opts.inputLang)) {
+      // ── BizGrowHub proxy → server-side Bangla ASR (free for end users) ──
+      raw = await transcribeViaBizGrowHub({
+        bghBaseUrl: opts.bghBaseUrl,
+        bghToken: opts.bghToken,
+        audioPath: tmpPath,
+        inputLang: opts.inputLang,
+        log,
+      });
     } else if (opts.sttProvider === 'groq' && opts.groqKey) {
       // ── Groq Whisper (10-20x faster) ──
-      log(`calling Groq STT (whisper-large-v3-turbo)...`);
+      // whisper-large-v3 (non-turbo) — slightly higher accuracy, esp. for
+      // low-resource languages like Bangla. Worth the speed trade-off when
+      // a language seed is in play.
+      const groqModel = langSeed(opts.inputLang) ? 'whisper-large-v3' : 'whisper-large-v3-turbo';
+      log(`calling Groq STT (${groqModel})...`);
       const groq = new OpenAI({
         apiKey: opts.groqKey,
         baseURL: 'https://api.groq.com/openai/v1',
       });
       const isoLang = toISO639(opts.inputLang);
+      const promptHint = buildPrompt(opts);
       const sttAbort = AbortSignal.timeout(STT_TIMEOUT);
       const transcription = await groq.audio.transcriptions.create(
         {
           file: createReadStream(tmpPath) as any,
-          model: 'whisper-large-v3-turbo',
+          model: groqModel,
+          ...(promptHint ? { prompt: promptHint } : {}),
           ...(isoLang ? { language: isoLang } : {}),
         },
         { signal: sttAbort },
@@ -157,16 +254,14 @@ export async function runPipeline(opts: {
       if (!opts.apiKey) throw new Error('Missing API key. Open Settings.');
       const openai = new OpenAI({ apiKey: opts.apiKey });
       log(`calling OpenAI STT (${opts.sttModel})...`);
-      const vocabPrompt = opts.vocabulary?.trim()
-        ? `Domain vocabulary: ${opts.vocabulary.trim()}`
-        : undefined;
       const isoLang = toISO639(opts.inputLang);
+      const promptHint = buildPrompt(opts);
       const sttAbort = AbortSignal.timeout(STT_TIMEOUT);
       const transcription = await openai.audio.transcriptions.create(
         {
           file: createReadStream(tmpPath) as any,
           model: opts.sttModel,
-          ...(vocabPrompt ? { prompt: vocabPrompt } : {}),
+          ...(promptHint ? { prompt: promptHint } : {}),
           ...(isoLang ? { language: isoLang } : {}),
         },
         { signal: sttAbort },

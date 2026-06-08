@@ -39,6 +39,7 @@ type Settings = {
   groqKeyEncrypted: string;
   openrouterKeyEncrypted: string;
   customKeyEncrypted: string;
+  useBetterBangla: boolean;       // route Bangla STT through BizGrowHub proxy
   customBaseUrl: string;
   customChatModel: string;
   customHeaders: string;  // JSON string, e.g. '{"HTTP-Referer":"..."}'
@@ -100,6 +101,7 @@ const store = new Store<Settings>({
     groqKeyEncrypted: '',
     openrouterKeyEncrypted: '',
     customKeyEncrypted: '',
+    useBetterBangla: false,
     customBaseUrl: '',
     customChatModel: '',
     customHeaders: '',
@@ -167,7 +169,7 @@ const DATA_KEYS: (keyof Settings)[] = [
   'sttProvider', 'gptProvider', 'skipGpt', 'launchOnStartup', 'micDeviceId', 'vocabulary', 'modes', 'activeMode',
   'silenceMs', 'autoStop', 'useLocalWhisper', 'localModel', 'micFallbackId', 'muteWhileRecording',
   'dictionary', 'theme', 'widgetStyle', 'instructions',
-  'customBaseUrl', 'customChatModel', 'customHeaders',
+  'customBaseUrl', 'customChatModel', 'customHeaders', 'useBetterBangla',
 ];
 
 function bghAuthFetch(path: string, init: RequestInit = {}) {
@@ -830,6 +832,7 @@ ipcMain.handle('settings:get', async () => {
     customBaseUrl: S.customBaseUrl,
     customChatModel: S.customChatModel,
     customHeaders: S.customHeaders,
+    useBetterBangla: S.useBetterBangla,
     hasKey:           !!store.get('openaiKeyEncrypted'),
     hasGroqKey:       !!store.get('groqKeyEncrypted'),
     hasOpenrouterKey: !!store.get('openrouterKeyEncrypted'),
@@ -1033,6 +1036,9 @@ ipcMain.handle('transcribe', async (_e, audioBase64: string, durationMs: number 
       groqKey: getGroqKey(),
       openrouterKey: getOpenrouterKey(),
       customKey: getCustomKey(),
+      useBetterBangla: S.useBetterBangla,
+      bghBaseUrl: BIZGROWHUB_API,
+      bghToken: getAuthToken(),
       customBaseUrl: S.customBaseUrl,
       customHeaders: S.customHeaders,
       inputLang,

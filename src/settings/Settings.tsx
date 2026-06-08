@@ -136,6 +136,7 @@ export function Settings() {
   const [customBaseUrl, setCustomBaseUrl] = useState('');
   const [customChatModel, setCustomChatModel] = useState('');
   const [customHeaders, setCustomHeaders] = useState('');
+  const [useBetterBangla, setUseBetterBangla] = useState(false);
   const [skipGpt, setSkipGpt] = useState(false);
   const [muteWhileRecording, setMuteWhileRecording] = useState(false);
   const [dictionary, setDictionary] = useState<DictEntry[]>([]);
@@ -218,6 +219,7 @@ export function Settings() {
       if (s.hasOpenrouterKey) setOpenrouterKey('••••••••••••••••••••');
       setHasCustomKey(!!s.hasCustomKey);
       if (s.hasCustomKey) setCustomKey('••••••••••••••••••••');
+      setUseBetterBangla(s.useBetterBangla ?? false);
       setSkipGpt(s.skipGpt ?? false);
       setMuteWhileRecording(s.muteWhileRecording ?? false);
       setDictionary(s.dictionary || []);
@@ -839,6 +841,26 @@ export function Settings() {
                 <Label>Custom Vocabulary</Label>
                 <HelpText>Comma-separated terms (names, jargon) for better recognition.</HelpText>
                 <textarea value={vocabulary} onChange={(e) => setVocabulary(e.target.value)} onBlur={() => save({ vocabulary }, 'Vocabulary saved')} rows={2} placeholder="React, Next.js, Supabase, Prisma" className={inputCls + ' font-mono text-[11px] resize-none'} />
+              </Card>
+
+              {/* Better Bangla — routes Bangla audio through a server-side
+                  ASR model on BizGrowHub. No additional account or token
+                  needed; works with the same login users already have. */}
+              <Card>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <Label>Improved Bangla transcription</Label>
+                    <HelpText>
+                      Routes Bangla audio through a Bangla-tuned ASR model on the BizGrowHub backend. No extra token needed — works with your existing login. Far more accurate than default Whisper for Bangla.
+                    </HelpText>
+                  </div>
+                  <Toggle on={useBetterBangla} onClick={() => { const v = !useBetterBangla; setUseBetterBangla(v); save({ useBetterBangla: v }, v ? 'Improved Bangla enabled' : 'Default Bangla'); }} />
+                </div>
+                {useBetterBangla && (
+                  <div className="text-[11px] text-white/40 mt-2">
+                    Bangla dictation will route to the BizGrowHub Bangla model. Other languages keep using your selected provider above. First request may take 10–30s (cold start); subsequent ones are fast.
+                  </div>
+                )}
               </Card>
             </Section>
           )}
