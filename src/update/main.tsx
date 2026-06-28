@@ -1,5 +1,6 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
+import '../lib/tauriApi'; // installs window.api under Tauri; no-op under Electron
 import { Update } from './Update';
 import '../styles.css';
 

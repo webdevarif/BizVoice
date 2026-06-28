@@ -11,6 +11,7 @@ const LANGS: { value: Lang; label: string }[] = [
   { value: 'auto', label: 'Auto detect' },
   { value: 'English', label: 'English' },
   { value: 'Bangla', label: 'Bangla (বাংলা)' },
+  { value: 'Banglish', label: 'Banglish (Bangla in English letters)' },
   { value: 'Hindi', label: 'Hindi (हिन्दी)' },
   { value: 'Urdu', label: 'Urdu (اردو)' },
   { value: 'Arabic', label: 'Arabic (العربية)' },
@@ -379,7 +380,10 @@ export function Settings() {
     if (e.ctrlKey) parts.push('CommandOrControl');
     if (e.shiftKey) parts.push('Shift');
     if (e.altKey) parts.push('Alt');
-    const key = e.key.length === 1 ? e.key.toUpperCase() : e.key;
+    // Space arrives as ' ' (length 1) — map it to the named "Space" token Tauri's
+    // accelerator parser expects, otherwise the combo saves as "...Shift+ " (a
+    // trailing space) which displays as "Ctrl + Shift + " and never registers.
+    const key = e.key === ' ' ? 'Space' : e.key.length === 1 ? e.key.toUpperCase() : e.key;
     if (!['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) {
       parts.push(key);
       const combo = parts.join('+');

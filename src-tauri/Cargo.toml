@@ -1,0 +1,77 @@
+[package]
+name = "bizvoice"
+version = "0.1.25"
+description = "BizVoice - AI voice typing (Tauri)"
+authors = ["BizVoice"]
+edition = "2021"
+
+# Phase 0 spike scaffold. The lib crate holds the app logic so it can later be
+# unit-tested and shared; main.rs is just the entry point.
+[lib]
+name = "bizvoice_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# tray-icon: system tray + menu (Phase 3), replacing Electron's Tray/Menu.
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Phase 2: local settings/history persistence (mirrors the Electron app's electron-store).
+tauri-plugin-store = "2"
+# Phase 3: global hotkeys (toggle / push-to-talk / cycle), replacing Electron's globalShortcut.
+tauri-plugin-global-shortcut = "2"
+# Phase 4: cloud STT/GPT pipeline (OpenAI-compatible HTTP). rustls avoids OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["multipart", "json", "rustls-tls"] }
+base64 = "0.22"
+regex = "1"
+# Phase 3/5 plugins: auth links, update prompts, auto-update, autostart, single-instance, clipboard.
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-clipboard-manager = "2"
+
+# Win32 calls for the mic-bar overlay re-pin (SetWindowPos HWND_TOPMOST +
+# WS_EX_NOACTIVATE) — Tauri has no moveTop() equivalent. Same `windows` version
+# Tauri/wry already pull in, so it unifies (no extra crate, offline-friendly).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# Local STT (Phase 4) — behind the `local-whisper` feature. whisper-rs = Rust
+# bindings to whisper.cpp; consumes the SAME ggml-*.bin models the app downloads
+# from HF ggerganov/whisper.cpp (no re-download). hound decodes the recorded WAV.
+# NOTE: kept optional because whisper-rs-sys 0.13.1's bindgen-generated layout
+# assertion (`whisper_full_params` size) currently fails to compile with the
+# installed clang ("attempt to compute 1usize - 264usize"); the default build
+# stays green/shippable. Enable with `--features local-whisper` once the
+# whisper-rs/bindgen version mismatch is resolved (the inference code in
+# src/whisper.rs + the linear resampler are complete and ready).
+whisper-rs = { version = "0.14", optional = true }
+hound = { version = "3.5", optional = true }
+
+[features]
+local-whisper = ["dep:whisper-rs", "dep:hound"]
+
+[profile.dev]
+# This low-RAM machine thrashes (swaps) during the debug LINK because full
+# debuginfo balloons it to ~1.7 GB. Dropping debuginfo shrinks the link to a few
+# hundred MB → no swap → dev rebuilds go from ~25 min to ~2 min. We lose line
+# numbers in panic backtraces; bump to `debug = 1` temporarily if needed.
+debug = false
+
+[profile.release]
+# lto=true + codegen-units=1 give the smallest binary but are very slow to build
+# on this low-RAM machine. The installer size win comes from WebView2 (no bundled
+# Chromium) — not LTO — so keep the first installer build fast. Re-enable
+# `lto = true` + `codegen-units = 1` for the final shipping build to trim a few MB.
+panic = "abort"
+opt-level = "s"
+strip = true
+codegen-units = 16

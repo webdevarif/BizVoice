@@ -14,7 +14,16 @@ import type { MicVAD as MicVADType } from '@ricky0123/vad-web';
 type State = 'idle' | 'recording' | 'processing' | 'done' | 'error';
 
 const BAR_COUNT      = 5;
-const VAD_ASSET_PATH = './vad/';
+// VAD assets (silero ONNX model + audio worklet) are FETCHED (binary fetch /
+// audioWorklet.addModule), so they load fine from /public → '/vad/'.
+const VAD_ASSET_PATH = '/vad/';
+// ORT is different: it loads its wasm glue via a dynamic import(`${wasmPaths}
+// ort-wasm-simd-threaded.mjs`), and Vite DEV forbids importing files out of
+// /public ("can only be referenced via HTML tags") — while a relative path
+// resolves against the dep at /node_modules/.vite/deps/ (404). So in dev, point
+// ORT at its real node_modules dir, which Vite serves as a proper module. The
+// production build has everything copied into /vad/ by copyVadAssets.
+const ORT_BASE = import.meta.env.DEV ? '/node_modules/onnxruntime-web/dist/' : '/vad/';
 
 // ── brand logo ────────────────────────────────────────────────────────────────
 // Inlined SVG so the icon can never fail to load due to path/asar/cache issues.
@@ -301,10 +310,10 @@ export function MicBar() {
     const vad = await MicVAD.new({
       ortConfig(ort: any) {
         ort.env.wasm.numThreads = 1;
-        ort.env.wasm.wasmPaths  = VAD_ASSET_PATH;
+        ort.env.wasm.wasmPaths  = ORT_BASE;
       },
       baseAssetPath:    VAD_ASSET_PATH,
-      onnxWASMBasePath: VAD_ASSET_PATH,
+      onnxWASMBasePath: ORT_BASE,
       getStream:    async () => stream,
       pauseStream:  async () => {},
       resumeStream: async () => stream,

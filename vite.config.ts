@@ -1,6 +1,5 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import electron from 'vite-plugin-electron';
 import { resolve } from 'path';
 import { copyFileSync, mkdirSync } from 'fs';
 
@@ -30,35 +29,45 @@ function copyVadAssets() {
   };
 }
 
+// onnxruntime-web's dist dir — used to alias vad-web's ORT imports to ORT's
+// self-contained ESM "bundle" builds (forward slashes for Vite on Windows).
+const ortDist = resolve(__dirname, 'node_modules/onnxruntime-web/dist').replace(/\\/g, '/');
+
+// Tauri-only frontend (Electron has been removed). Tauri's beforeDev/Build
+// commands run `vite`/`vite build`; the Rust shell loads the built HTML from
+// `dist/` (or the dev server on :5173).
 export default defineConfig({
-  plugins: [
-    react(),
-    copyVadAssets(),
-    electron([
-      {
-        entry: 'electron/main/index.ts',
-        vite: {
-          build: {
-            outDir: 'dist-electron/main',
-            rollupOptions: {
-              external: ['@fugood/whisper.node'],
-            },
-          },
-        },
-      },
-      {
-        entry: 'electron/preload/index.ts',
-        onstart(options) {
-          options.reload();
-        },
-        vite: {
-          build: {
-            outDir: 'dist-electron/preload',
-          },
-        },
-      },
-    ]),
-  ],
+  plugins: [react(), copyVadAssets()],
+  resolve: {
+    // @ricky0123/vad-web is CommonJS and pulls ORT in via `require("onnxruntime-web")`
+    // (non-realtime) and `require("onnxruntime-web/wasm")` (MicVAD/realtime). Their
+    // `require` condition resolves to ORT's CJS builds, which reference an EXTERNAL
+    // `ort-wasm-*.mjs` loader the Vite optimizer can't emit ("…ort-wasm-simd-threaded
+    // .mjs does not exist") — and marking ORT external instead turns the CJS require
+    // into an unsupported dynamic require ("require of 'onnxruntime-web/wasm'"). Fix:
+    // alias both specifiers to ORT's *.bundle.min.mjs ESM builds (wasm loader inlined),
+    // so esbuild bundles a self-contained module. The actual .wasm binary is still
+    // fetched at runtime from wasmPaths = VAD_ASSET_PATH ('./vad/', via copyVadAssets).
+    // Regex `$` anchors keep the bare match from clobbering the /wasm subpath.
+    alias: [
+      { find: /^onnxruntime-web\/wasm$/, replacement: `${ortDist}/ort.wasm.bundle.min.mjs` },
+      { find: /^onnxruntime-web$/, replacement: `${ortDist}/ort.bundle.min.mjs` },
+    ],
+  },
+  // vad-web is CommonJS (no "module"/"exports" field) so Vite MUST pre-bundle it
+  // (CJS→ESM) — otherwise the browser gets raw `exports.…` → "exports is not defined".
+  // `include` forces that even though it's reached via a dynamic import().
+  optimizeDeps: {
+    include: ['@ricky0123/vad-web'],
+  },
+  // Tauri expects a fixed dev port. Vite must NOT watch src-tauri/ — cargo locks
+  // files under target/ during builds and the watcher crashes (EBUSY) on a busy .exe.
+  clearScreen: false,
+  server: {
+    port: 5173,
+    strictPort: true,
+    watch: { ignored: ['**/src-tauri/**'] },
+  },
   build: {
     rollupOptions: {
       input: {

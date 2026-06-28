@@ -1,0 +1,10 @@
+# Build artifacts go to the project's own `src-tauri/target/` (cargo default).
+#
+# NOTE: this was previously redirected to C:/Users/User/bizvoice-target because
+# cargo's freshness scan over target/ on the F: backup drive could hang in an
+# uninterruptible kernel I/O wait (the process couldn't even be killed). If
+# `cargo build` / `tauri dev` / `tauri build` ever hangs unkillably from this
+# folder, restore the redirect by uncommenting the two lines below:
+#
+# [build]
+# target-dir = "C:/Users/User/bizvoice-target"

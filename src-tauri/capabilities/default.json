@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core window/store APIs for all app windows.",
+  "windows": ["login", "settings", "update", "micbar"],
+  "permissions": ["core:default", "store:default", "updater:default"]
+}
