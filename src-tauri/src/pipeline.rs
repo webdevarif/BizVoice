@@ -303,10 +303,11 @@ pub async fn gpt_refine(opts: &PipelineOpts, raw: String) -> String {
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                if !out.is_empty() {
+                let clean = sanitize_refined(&out);
+                if !clean.is_empty() {
                     #[cfg(debug_assertions)]
-                    eprintln!("[refine] out={out:?}");
-                    return out;
+                    eprintln!("[refine] out={clean:?}");
+                    return clean;
                 }
             }
             // Non-2xx (dead model, rate-limit…) — log and fall through to the next.
@@ -330,4 +331,143 @@ pub async fn gpt_refine(opts: &PipelineOpts, raw: String) -> String {
     }
     // Every model failed — return the raw transcription unchanged.
     raw
+}
+
+/// Strip conversational scaffolding a chat model sometimes wraps around the
+/// refined text despite being told to "output ONLY the corrected text" — a
+/// leading preamble line ("Here is the corrected sentence:"), surrounding
+/// quotes, or a markdown code fence.
+///
+/// This matters beyond cosmetics: a leaked preamble carries a trailing newline,
+/// and the per-app char-typer turns every '\n' into an Enter keypress (see
+/// `Type` in paste.rs). So an un-stripped "Here is the corrected sentence:\n<text>"
+/// gets typed into the focused chat input and the newline *submits the preamble
+/// as its own message*, leaving the real text behind. Stripping it kills both
+/// the stray text and the stray submit.
+///
+/// Conservative by design: only strips at the very start, only when a known
+/// refine cue is present, and never blanks the result.
+pub fn sanitize_refined(text: &str) -> String {
+    let mut out = strip_code_fence(text.trim());
+
+    // Drop a leading "Here is the corrected sentence:"-style preamble.
+    if let Some(colon) = out.find(':') {
+        let prefix = &out[..colon];
+        if !prefix.contains('\n') && prefix.chars().count() <= 70 {
+            let p = prefix.to_lowercase();
+            let starts_cue = p.starts_with("here")
+                || p.starts_with("sure")
+                || p.starts_with("corrected")
+                || p.starts_with("the corrected");
+            let refine_cue = p.contains("correct")
+                || p.contains("fixed")
+                || p.contains("revised")
+                || p.contains("here is the")
+                || p.contains("here's the");
+            if starts_cue && refine_cue {
+                let rest = out[colon + 1..].trim_start();
+                // Never blank the result: keep the original if nothing follows.
+                if !rest.is_empty() {
+                    out = rest.to_string();
+                }
+            }
+        }
+    }
+
+    unwrap_quotes(out.trim())
+}
+
+/// Remove a single ```fence … ``` wrapper if the model returned one.
+fn strip_code_fence(text: &str) -> String {
+    let t = text.trim();
+    let Some(after_open) = t.strip_prefix("```") else {
+        return t.to_string();
+    };
+    // Drop the remainder of the opening line (an optional language tag).
+    let body = match after_open.find('\n') {
+        Some(nl) => &after_open[nl + 1..],
+        None => return t.to_string(), // lone "```…": not a real block, leave it
+    };
+    let body = match body.rfind("```") {
+        Some(idx) => &body[..idx],
+        None => body,
+    };
+    body.trim().to_string()
+}
+
+/// Strip one matching pair of surrounding quotes, unless doing so would split
+/// content that legitimately contains interior quotes (e.g. `"a" and "b"`).
+fn unwrap_quotes(text: &str) -> String {
+    let t = text.trim();
+    const PAIRS: [(char, char); 5] =
+        [('"', '"'), ('\'', '\''), ('\u{201C}', '\u{201D}'), ('\u{2018}', '\u{2019}'), ('\u{00AB}', '\u{00BB}')];
+    let Some(first) = t.chars().next() else {
+        return t.to_string();
+    };
+    let last = t.chars().last().unwrap();
+    for (open, close) in PAIRS {
+        if first == open && last == close && t.chars().count() >= 2 {
+            let inner = &t[open.len_utf8()..t.len() - close.len_utf8()];
+            if !inner.contains(open) && !inner.contains(close) {
+                return inner.trim().to_string();
+            }
+        }
+    }
+    t.to_string()
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_refined;
+
+    #[test]
+    fn strips_preamble_on_new_line() {
+        // The exact failure from the report: preamble + newline → just the text.
+        let s = "Here is the corrected sentence:\nThis is all my Shopify client.";
+        assert_eq!(sanitize_refined(s), "This is all my Shopify client.");
+    }
+
+    #[test]
+    fn strips_inline_preamble() {
+        let s = "Sure! Here's the corrected text: This is all my Shopify client.";
+        assert_eq!(sanitize_refined(s), "This is all my Shopify client.");
+    }
+
+    #[test]
+    fn strips_corrected_label() {
+        assert_eq!(sanitize_refined("Corrected: hello there"), "hello there");
+    }
+
+    #[test]
+    fn unwraps_surrounding_quotes() {
+        assert_eq!(
+            sanitize_refined("\"This is all my Shopify client.\""),
+            "This is all my Shopify client."
+        );
+    }
+
+    #[test]
+    fn strips_code_fence() {
+        assert_eq!(sanitize_refined("```\nhello world\n```"), "hello world");
+    }
+
+    #[test]
+    fn keeps_legit_colon_sentence() {
+        // No refine cue in the prefix → must be left untouched.
+        let s = "Tell him the meeting is at 5: bring the deck.";
+        assert_eq!(sanitize_refined(s), s);
+    }
+
+    #[test]
+    fn keeps_interior_quotes() {
+        let s = "\"a\" and \"b\"";
+        assert_eq!(sanitize_refined(s), s);
+    }
+
+    #[test]
+    fn never_blanks_a_bare_preamble() {
+        // Preamble with nothing after the colon → leave as-is rather than blank.
+        let s = "Here is the corrected sentence:";
+        assert_eq!(sanitize_refined(s), s);
+    }
 }

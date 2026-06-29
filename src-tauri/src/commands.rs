@@ -879,12 +879,12 @@ async fn refine_via_provider(s: &Value, text: &str) -> Result<String, String> {
         return Err(format!("Refine failed (HTTP {})", resp.status()));
     }
     let data: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let refined = data
+    let raw = data
         .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
+        .unwrap_or("");
+    // Strip any "Here is the corrected sentence:"-style preamble the model leaks.
+    let refined = crate::pipeline::sanitize_refined(raw);
     if refined.is_empty() {
         return Err("Empty refinement result".into());
     }
