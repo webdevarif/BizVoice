@@ -205,7 +205,9 @@ fn default_settings() -> Value {
         "gptProvider": "openai",
         "sttModel": "whisper-1",
         "sttProvider": "openai",
-        "skipGpt": false,
+        // AI Formatting OFF by default: paste the exact raw transcript, and only
+        // run the GPT refine step when the user explicitly turns AI Formatting on.
+        "skipGpt": true,
         "launchOnStartup": false,
         "micDeviceId": "",
         "vocabulary": "",
@@ -462,7 +464,8 @@ pub async fn transcribe(
         custom_base_url: str_field("customBaseUrl", ""),
         custom_headers: str_field("customHeaders", ""),
         input_lang: str_field("inputLang", "auto"),
-        skip_gpt: s.get("skipGpt").and_then(|v| v.as_bool()).unwrap_or(false),
+        // Absent key → skip refine (AI Formatting defaults off), matching default_settings.
+        skip_gpt: s.get("skipGpt").and_then(|v| v.as_bool()).unwrap_or(true),
         style_prompt,
         vocabulary: str_field("vocabulary", ""),
         use_better_bangla: s.get("useBetterBangla").and_then(|v| v.as_bool()).unwrap_or(false),

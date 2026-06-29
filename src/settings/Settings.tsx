@@ -138,7 +138,7 @@ export function Settings() {
   const [customChatModel, setCustomChatModel] = useState('');
   const [customHeaders, setCustomHeaders] = useState('');
   const [useBetterBangla, setUseBetterBangla] = useState(false);
-  const [skipGpt, setSkipGpt] = useState(false);
+  const [skipGpt, setSkipGpt] = useState(true); // AI Formatting off by default
   const [muteWhileRecording, setMuteWhileRecording] = useState(false);
   const [dictionary, setDictionary] = useState<DictEntry[]>([]);
   const [theme, setTheme] = useState('dark');
@@ -221,7 +221,7 @@ export function Settings() {
       setHasCustomKey(!!s.hasCustomKey);
       if (s.hasCustomKey) setCustomKey('••••••••••••••••••••');
       setUseBetterBangla(s.useBetterBangla ?? false);
-      setSkipGpt(s.skipGpt ?? false);
+      setSkipGpt(s.skipGpt ?? true);
       setMuteWhileRecording(s.muteWhileRecording ?? false);
       setDictionary(s.dictionary || []);
       setTheme(s.theme || 'dark');
