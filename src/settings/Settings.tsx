@@ -415,41 +415,8 @@ export function Settings() {
     !dictSearch.trim() || (d.from + d.to + (d.category || '')).toLowerCase().includes(dictSearch.toLowerCase())
   );
 
-  const onTitleBarMouseDown = useCallback(async (e: React.MouseEvent) => {
-    if ((e.target as HTMLElement).closest('button')) return;
-    const [wx, wy] = await window.api.getWinPos();
-    const start = { x: e.screenX, y: e.screenY, wx, wy };
-    const onMove = (ev: MouseEvent) => {
-      window.api.setWinPos(start.wx + (ev.screenX - start.x), start.wy + (ev.screenY - start.y));
-    };
-    const onUp = () => {
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-      document.body.style.cursor = '';
-    };
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
-    document.body.style.cursor = 'grabbing';
-  }, []);
-
   return (
     <div className="h-screen flex flex-col text-white" style={{ background: 'linear-gradient(135deg, #0f0f15 0%, #15151d 100%)' }}>
-      {/* Title bar — JS-based drag via IPC (same pattern as MicBar). */}
-      <div
-        className="flex items-center justify-between px-5 py-3 border-b border-white/5 select-none cursor-grab active:cursor-grabbing"
-        onMouseDown={onTitleBarMouseDown}
-      >
-        <div className="flex items-center gap-2.5 pointer-events-none">
-          <NeuroLogo size={18} />
-          <div className="font-semibold text-sm tracking-wide">BizVoice</div>
-          <div className="text-xs text-white/30">Settings</div>
-        </div>
-        <button
-          className="w-7 h-7 flex items-center justify-center rounded-md hover:bg-white/10 text-white/50 hover:text-white transition-colors cursor-pointer"
-          onClick={() => window.api.closeWindow()}
-        >&#10005;</button>
-      </div>
-
       <div className="flex-1 flex min-h-0">
         {/* Sidebar */}
         <div className="w-48 border-r border-white/5 flex flex-col">
