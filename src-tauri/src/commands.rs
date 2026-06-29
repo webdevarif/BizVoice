@@ -329,6 +329,10 @@ pub fn focus_or_open_settings(app: &tauri::AppHandle) -> Result<(), String> {
         .inner_size(720.0, 580.0)
         .min_inner_size(600.0, 420.0)
         .resizable(true)
+        // No native title bar — the React app draws its own (logo + close).
+        // Without this the rebuilt window shows BOTH bars (the conf window sets
+        // decorations:false but this runtime-rebuilt one must match it).
+        .decorations(false)
         .center()
         .build()
         .map_err(|e| e.to_string())?;
