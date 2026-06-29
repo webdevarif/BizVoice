@@ -215,6 +215,9 @@ fn default_settings() -> Value {
         "activeMode": "transcript",
         "silenceMs": 1200,
         "autoStop": true,
+        // Live dictation: keep the VAD running and transcribe + type each phrase
+        // the moment the user pauses, instead of one utterance then stop.
+        "liveDictation": false,
         "useLocalWhisper": false,
         "localModel": "",
         "micFallbackId": "",
