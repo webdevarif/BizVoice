@@ -180,6 +180,20 @@ fn decode_key(settings: &Value, enc_field: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Persist a single field INSIDE the `settings` object (where every reader looks
+/// via `store.get(SETTINGS_KEY)`). The auth flow used to write the token as a
+/// TOP-LEVEL store key (`store.set("bizgrowhubTokenEncrypted", …)`), which no
+/// reader ever saw — so login never "stuck" and the app stayed logged-out.
+fn settings_merge(app: &tauri::AppHandle, key: &str, value: Value) {
+    let Ok(store) = app.store(SETTINGS_STORE) else { return };
+    let mut s = store.get(SETTINGS_KEY).unwrap_or_else(default_settings);
+    if let Some(obj) = s.as_object_mut() {
+        obj.insert(key.to_string(), value);
+    }
+    store.set(SETTINGS_KEY, s);
+    let _ = store.save();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Settings & windows
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1119,11 +1133,11 @@ pub fn start_browser_login(app: tauri::AppHandle) -> Result<Value, String> {
             let _ = stream.write_all(resp.as_bytes());
 
             if ok {
-                if let Ok(store) = app2.store(SETTINGS_STORE) {
+                {
                     use base64::Engine;
                     let enc = base64::engine::general_purpose::STANDARD.encode(token.as_bytes());
-                    store.set("bizgrowhubTokenEncrypted", json!(enc));
-                    let _ = store.save();
+                    // Store INSIDE the settings object (where all readers look).
+                    settings_merge(&app2, "bizgrowhubTokenEncrypted", json!(enc));
                 }
                 let _ = app2.emit(
                     "auth:changed",
@@ -1191,10 +1205,8 @@ pub fn cancel_browser_login() -> Value {
 
 #[tauri::command]
 pub fn logout(app: tauri::AppHandle) -> Result<Value, String> {
-    let store = app.store(SETTINGS_STORE).map_err(|e| e.to_string())?;
-    store.set("bizgrowhubTokenEncrypted", json!(""));
-    store.set("licenseOkAt", json!(0));
-    store.save().map_err(|e| e.to_string())?;
+    settings_merge(&app, "bizgrowhubTokenEncrypted", json!(""));
+    settings_merge(&app, "licenseOkAt", json!(0));
     if let Some(w) = app.get_webview_window("micbar") {
         let _ = w.hide();
     }
@@ -1238,16 +1250,14 @@ pub async fn auth_status(app: tauri::AppHandle) -> Result<Value, String> {
         .await;
     match resp {
         Ok(r) if r.status().as_u16() == 401 => {
-            store.set("bizgrowhubTokenEncrypted", json!(""));
-            let _ = store.save();
+            settings_merge(&app, "bizgrowhubTokenEncrypted", json!(""));
             Ok(json!({ "loggedIn": false, "active": false, "email": "" }))
         }
         Ok(r) if r.status().is_success() => {
             let data: Value = r.json().await.unwrap_or_else(|_| json!({}));
             let active = data.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
             if active {
-                store.set("licenseOkAt", json!(now_ms()));
-                let _ = store.save();
+                settings_merge(&app, "licenseOkAt", json!(now_ms()));
                 on_licensed(&app);
             }
             Ok(json!({ "loggedIn": true, "active": active, "email": email }))
