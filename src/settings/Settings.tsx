@@ -121,6 +121,7 @@ export function Settings() {
   const [vocabulary, setVocabulary] = useState('');
   const [silenceMs, setSilenceMs] = useState(1500);
   const [autoStop, setAutoStop] = useState(false);
+  const [liveDictation, setLiveDictation] = useState(false);
   const [useLocalWhisper, setUseLocalWhisper] = useState(false);
   const [localModel, setLocalModel] = useState('base');
   const [whisperModels, setWhisperModels] = useState<{ name: string; size: string; downloaded: boolean }[]>([]);
@@ -138,7 +139,8 @@ export function Settings() {
   const [customChatModel, setCustomChatModel] = useState('');
   const [customHeaders, setCustomHeaders] = useState('');
   const [useBetterBangla, setUseBetterBangla] = useState(false);
-  const [skipGpt, setSkipGpt] = useState(false);
+  const [useScribe, setUseScribe] = useState(false);
+  const [skipGpt, setSkipGpt] = useState(true); // AI Formatting off by default
   const [muteWhileRecording, setMuteWhileRecording] = useState(false);
   const [dictionary, setDictionary] = useState<DictEntry[]>([]);
   const [theme, setTheme] = useState('dark');
@@ -209,6 +211,7 @@ export function Settings() {
       setVocabulary(s.vocabulary || '');
       setSilenceMs(s.silenceMs ?? 1500);
       setAutoStop(s.autoStop ?? false);
+      setLiveDictation(s.liveDictation ?? false);
       setUseLocalWhisper(s.useLocalWhisper ?? false);
       setLocalModel(s.localModel || 'base');
       setSttProvider(s.sttProvider || 'openai');
@@ -221,7 +224,8 @@ export function Settings() {
       setHasCustomKey(!!s.hasCustomKey);
       if (s.hasCustomKey) setCustomKey('••••••••••••••••••••');
       setUseBetterBangla(s.useBetterBangla ?? false);
-      setSkipGpt(s.skipGpt ?? false);
+      setUseScribe(s.useScribe ?? false);
+      setSkipGpt(s.skipGpt ?? true);
       setMuteWhileRecording(s.muteWhileRecording ?? false);
       setDictionary(s.dictionary || []);
       setTheme(s.theme || 'dark');
@@ -785,13 +789,23 @@ export function Settings() {
                   <div><Label>Auto-stop on silence</Label><HelpText>Stop recording automatically after silence.</HelpText></div>
                   <Toggle on={autoStop} onClick={() => { const v = !autoStop; setAutoStop(v); save({ autoStop: v }); }} />
                 </div>
-                {autoStop && (
-                  <>
-                    <div className="flex items-center justify-between mt-3 mb-1"><span className="text-[11px] text-white/50">Silence threshold</span><span className="text-xs text-blue-400 font-mono">{silenceMs}ms</span></div>
-                    <input type="range" min={500} max={4000} step={100} value={silenceMs} onChange={(e) => setSilenceMs(Number(e.target.value))} onMouseUp={() => save({ silenceMs })} className="w-full accent-blue-500" />
-                  </>
-                )}
               </Card>
+              <Card>
+                <div className="flex items-center justify-between">
+                  <div><Label>Live dictation</Label><HelpText>Type each phrase the moment you pause, then keep listening — like Google voice typing. Runs until you stop. Tip: turn AI Formatting off for the fastest, most literal results.</HelpText></div>
+                  <Toggle on={liveDictation} onClick={() => { const v = !liveDictation; setLiveDictation(v); save({ liveDictation: v }, v ? 'Live dictation on' : 'Live dictation off'); }} />
+                </div>
+              </Card>
+              {(autoStop || liveDictation) && (
+                <Card>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-[11px] text-white/50">{liveDictation ? 'Pause before typing' : 'Silence threshold'}</span>
+                    <span className="text-xs text-blue-400 font-mono">{silenceMs}ms</span>
+                  </div>
+                  <input type="range" min={500} max={4000} step={100} value={silenceMs} onChange={(e) => setSilenceMs(Number(e.target.value))} onMouseUp={() => save({ silenceMs })} className="w-full accent-blue-500" />
+                  {liveDictation && <HelpText>How long a pause ends a phrase and sends it to be typed. Lower = snappier chunks.</HelpText>}
+                </Card>
+              )}
             </Section>
           )}
 
@@ -832,6 +846,20 @@ export function Settings() {
                     Bangla dictation will route to the BizGrowHub Bangla model. Other languages keep using your selected provider above. First request may take 10–30s (cold start); subsequent ones are fast.
                   </div>
                 )}
+              </Card>
+
+              {/* Premium STT — ElevenLabs Scribe via the BizGrowHub proxy.
+                  Best accuracy (incl. Bangla); same login, no extra key. */}
+              <Card>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <Label>Premium transcription (Scribe)</Label>
+                    <HelpText>
+                      Routes audio through ElevenLabs Scribe on the BizGrowHub backend — the most accurate model, especially for Bangla. No extra token; works with your login. Overrides the options above when on.
+                    </HelpText>
+                  </div>
+                  <Toggle on={useScribe} onClick={() => { const v = !useScribe; setUseScribe(v); save({ useScribe: v }, v ? 'Premium (Scribe) enabled' : 'Scribe off'); }} />
+                </div>
               </Card>
             </Section>
           )}

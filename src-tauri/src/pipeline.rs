@@ -25,6 +25,7 @@ pub struct PipelineOpts {
     pub skip_gpt: bool,
     pub style_prompt: String,
     pub vocabulary: String,      // custom terms/names → Whisper STT prompt bias
+    pub use_scribe: bool,        // premium ElevenLabs Scribe STT via the proxy
     pub use_better_bangla: bool, // route Bangla through BizGrowHub's tuned ASR
     pub auth_token: String,      // BizGrowHub JWT (auth for the Bangla proxy)
     pub api_base: String,        // BizGrowHub base URL (e.g. https://bizgrowhub.shop)
@@ -70,6 +71,24 @@ pub async fn run_pipeline(opts: PipelineOpts) -> Result<String, String> {
 
     let client = reqwest::Client::new();
     let iso = to_iso(&opts.input_lang);
+
+    // ── Premium STT — ElevenLabs Scribe via the BizGrowHub proxy ───────────
+    // Best-in-class accuracy. Takes priority over the other STT paths when on
+    // and the user is signed in. No fallback: the user chose premium, so we
+    // surface failures instead of silently dropping to a weaker model.
+    if opts.use_scribe && !opts.auth_token.is_empty() {
+        let raw = scribe_stt(&client, &opts, &bytes).await?;
+        let raw = raw.trim().to_string();
+        #[cfg(debug_assertions)]
+        eprintln!("[stt] scribe raw = {raw:?}");
+        if raw.is_empty() {
+            return Ok(String::new());
+        }
+        if opts.skip_gpt {
+            return Ok(raw);
+        }
+        return Ok(gpt_refine(&opts, raw).await);
+    }
 
     // ── Improved Bangla transcription ──────────────────────────────────────
     // When the user enables it AND is speaking Bangla AND is signed in, route
@@ -204,6 +223,50 @@ async fn better_bangla_stt(
         .to_string())
 }
 
+/// Transcribe via ElevenLabs Scribe through the BizGrowHub proxy
+/// (POST /api/bizvoice/transcribe-scribe, authed with the user's JWT). Best
+/// Bangla accuracy; the language hint comes from the app's input_lang.
+async fn scribe_stt(
+    client: &reqwest::Client,
+    opts: &PipelineOpts,
+    audio: &[u8],
+) -> Result<String, String> {
+    let url = format!(
+        "{}/api/bizvoice/transcribe-scribe",
+        opts.api_base.trim_end_matches('/')
+    );
+    let part = reqwest::multipart::Part::bytes(audio.to_vec())
+        .file_name("audio.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| e.to_string())?;
+    let form = reqwest::multipart::Form::new()
+        .text("language", opts.input_lang.to_lowercase())
+        .part("file", part);
+
+    let resp = client
+        .post(&url)
+        .bearer_auth(&opts.auth_token)
+        .multipart(form)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .map_err(|e| format!("Scribe STT request failed: {e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(200).collect();
+        return Err(format!("Scribe STT failed ({status}): {snippet}"));
+    }
+
+    let data: Value = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(data
+        .get("transcript")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string())
+}
+
 /// GPT format/refine step (OpenAI-compatible chat/completions) using the active
 /// mode's `style_prompt`. Shared by the cloud pipeline and the local-whisper
 /// path (whose STT comes from whisper-rs, but still wants the same formatting).
@@ -303,10 +366,11 @@ pub async fn gpt_refine(opts: &PipelineOpts, raw: String) -> String {
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                if !out.is_empty() {
+                let clean = sanitize_refined(&out);
+                if !clean.is_empty() {
                     #[cfg(debug_assertions)]
-                    eprintln!("[refine] out={out:?}");
-                    return out;
+                    eprintln!("[refine] out={clean:?}");
+                    return clean;
                 }
             }
             // Non-2xx (dead model, rate-limit…) — log and fall through to the next.
@@ -330,4 +394,143 @@ pub async fn gpt_refine(opts: &PipelineOpts, raw: String) -> String {
     }
     // Every model failed — return the raw transcription unchanged.
     raw
+}
+
+/// Strip conversational scaffolding a chat model sometimes wraps around the
+/// refined text despite being told to "output ONLY the corrected text" — a
+/// leading preamble line ("Here is the corrected sentence:"), surrounding
+/// quotes, or a markdown code fence.
+///
+/// This matters beyond cosmetics: a leaked preamble carries a trailing newline,
+/// and the per-app char-typer turns every '\n' into an Enter keypress (see
+/// `Type` in paste.rs). So an un-stripped "Here is the corrected sentence:\n<text>"
+/// gets typed into the focused chat input and the newline *submits the preamble
+/// as its own message*, leaving the real text behind. Stripping it kills both
+/// the stray text and the stray submit.
+///
+/// Conservative by design: only strips at the very start, only when a known
+/// refine cue is present, and never blanks the result.
+pub fn sanitize_refined(text: &str) -> String {
+    let mut out = strip_code_fence(text.trim());
+
+    // Drop a leading "Here is the corrected sentence:"-style preamble.
+    if let Some(colon) = out.find(':') {
+        let prefix = &out[..colon];
+        if !prefix.contains('\n') && prefix.chars().count() <= 70 {
+            let p = prefix.to_lowercase();
+            let starts_cue = p.starts_with("here")
+                || p.starts_with("sure")
+                || p.starts_with("corrected")
+                || p.starts_with("the corrected");
+            let refine_cue = p.contains("correct")
+                || p.contains("fixed")
+                || p.contains("revised")
+                || p.contains("here is the")
+                || p.contains("here's the");
+            if starts_cue && refine_cue {
+                let rest = out[colon + 1..].trim_start();
+                // Never blank the result: keep the original if nothing follows.
+                if !rest.is_empty() {
+                    out = rest.to_string();
+                }
+            }
+        }
+    }
+
+    unwrap_quotes(out.trim())
+}
+
+/// Remove a single ```fence … ``` wrapper if the model returned one.
+fn strip_code_fence(text: &str) -> String {
+    let t = text.trim();
+    let Some(after_open) = t.strip_prefix("```") else {
+        return t.to_string();
+    };
+    // Drop the remainder of the opening line (an optional language tag).
+    let body = match after_open.find('\n') {
+        Some(nl) => &after_open[nl + 1..],
+        None => return t.to_string(), // lone "```…": not a real block, leave it
+    };
+    let body = match body.rfind("```") {
+        Some(idx) => &body[..idx],
+        None => body,
+    };
+    body.trim().to_string()
+}
+
+/// Strip one matching pair of surrounding quotes, unless doing so would split
+/// content that legitimately contains interior quotes (e.g. `"a" and "b"`).
+fn unwrap_quotes(text: &str) -> String {
+    let t = text.trim();
+    const PAIRS: [(char, char); 5] =
+        [('"', '"'), ('\'', '\''), ('\u{201C}', '\u{201D}'), ('\u{2018}', '\u{2019}'), ('\u{00AB}', '\u{00BB}')];
+    let Some(first) = t.chars().next() else {
+        return t.to_string();
+    };
+    let last = t.chars().last().unwrap();
+    for (open, close) in PAIRS {
+        if first == open && last == close && t.chars().count() >= 2 {
+            let inner = &t[open.len_utf8()..t.len() - close.len_utf8()];
+            if !inner.contains(open) && !inner.contains(close) {
+                return inner.trim().to_string();
+            }
+        }
+    }
+    t.to_string()
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_refined;
+
+    #[test]
+    fn strips_preamble_on_new_line() {
+        // The exact failure from the report: preamble + newline → just the text.
+        let s = "Here is the corrected sentence:\nThis is all my Shopify client.";
+        assert_eq!(sanitize_refined(s), "This is all my Shopify client.");
+    }
+
+    #[test]
+    fn strips_inline_preamble() {
+        let s = "Sure! Here's the corrected text: This is all my Shopify client.";
+        assert_eq!(sanitize_refined(s), "This is all my Shopify client.");
+    }
+
+    #[test]
+    fn strips_corrected_label() {
+        assert_eq!(sanitize_refined("Corrected: hello there"), "hello there");
+    }
+
+    #[test]
+    fn unwraps_surrounding_quotes() {
+        assert_eq!(
+            sanitize_refined("\"This is all my Shopify client.\""),
+            "This is all my Shopify client."
+        );
+    }
+
+    #[test]
+    fn strips_code_fence() {
+        assert_eq!(sanitize_refined("```\nhello world\n```"), "hello world");
+    }
+
+    #[test]
+    fn keeps_legit_colon_sentence() {
+        // No refine cue in the prefix → must be left untouched.
+        let s = "Tell him the meeting is at 5: bring the deck.";
+        assert_eq!(sanitize_refined(s), s);
+    }
+
+    #[test]
+    fn keeps_interior_quotes() {
+        let s = "\"a\" and \"b\"";
+        assert_eq!(sanitize_refined(s), s);
+    }
+
+    #[test]
+    fn never_blanks_a_bare_preamble() {
+        // Preamble with nothing after the colon → leave as-is rather than blank.
+        let s = "Here is the corrected sentence:";
+        assert_eq!(sanitize_refined(s), s);
+    }
 }

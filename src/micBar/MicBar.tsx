@@ -102,6 +102,11 @@ export function MicBar() {
   const micVADRef      = useRef<MicVADType | null>(null);
   const speechFiredRef = useRef(false);
 
+  // Live dictation: continuous VAD that types each phrase on pause.
+  const liveRef        = useRef(false);                       // is this a live session?
+  const queueRef       = useRef<Promise<void>>(Promise.resolve()); // serialize pastes in spoken order
+  const pastedCountRef = useRef(0);                           // segments pasted so far (for spacing)
+
   const stateRef  = useRef<State>('idle');
   const hasKeyRef = useRef(true);
   stateRef.current  = state;
@@ -199,8 +204,20 @@ export function MicBar() {
   async function getMicStream(s: Awaited<ReturnType<typeof window.api.getSettings>>): Promise<MediaStream> {
     const primary  = s.micDeviceId && s.micDeviceId !== 'default' ? s.micDeviceId : undefined;
     const fallback = s.micFallbackId && s.micFallbackId !== 'default' ? s.micFallbackId : undefined;
+    // Cleaner audio -> better STT: mono, 16 kHz-ish, with the browser's DSP on
+    // (noise suppression + echo cancel + auto-gain). The VAD path already
+    // downsamples to 16 kHz; this also helps the MediaRecorder fallback path.
+    const dsp: MediaTrackConstraints = {
+      channelCount: 1,
+      sampleRate: 16000,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    };
     const tryGet = (id?: string) =>
-      navigator.mediaDevices.getUserMedia({ audio: id ? { deviceId: { exact: id } } : true });
+      navigator.mediaDevices.getUserMedia({
+        audio: id ? { deviceId: { exact: id }, ...dsp } : { ...dsp },
+      });
     try {
       return await tryGet(primary);
     } catch {
@@ -234,6 +251,35 @@ export function MicBar() {
       setState('error');
       setTimeout(() => setState('idle'), 3000);
     }
+  }
+
+  // ── Live dictation: transcribe + paste one VAD segment, keep listening ─────
+  // Transcriptions run concurrently across segments, but pastes are serialized
+  // through queueRef so the text lands in the order it was spoken even when a
+  // later (shorter) phrase transcribes first. Per-segment errors are swallowed
+  // so one failed chunk can't end the session.
+  function enqueueSegment(audio: Float32Array) {
+    const durationMs = Math.round((audio.length / 16000) * 1000);
+    // Kick off STT immediately so segments transcribe in parallel.
+    const textPromise = (async () => {
+      try {
+        const b64 = await float32ToWavBase64(audio, 16000);
+        return await window.api.transcribe(b64, durationMs);
+      } catch {
+        return '';
+      }
+    })();
+    // Chain the paste so output order matches speech order.
+    queueRef.current = queueRef.current.then(async () => {
+      const text = (await textPromise)?.trim();
+      if (!text) return;
+      // Space between phrases so words don't run together; none before the first.
+      const prefix = pastedCountRef.current > 0 ? ' ' : '';
+      try {
+        await window.api.paste(prefix + text);
+        pastedCountRef.current += 1;
+      } catch { /* keep dictating even if one paste fails */ }
+    });
   }
 
   // ── MediaRecorder path ───────────────────────────────────────────────────
@@ -299,12 +345,17 @@ export function MicBar() {
 
   async function startVADRecording(s: Awaited<ReturnType<typeof window.api.getSettings>>) {
     const silenceMs = s.silenceMs ?? 1500;
+    const live = !!s.liveDictation;
+    liveRef.current = live;
 
     if (s.muteWhileRecording) window.api.muteSystem(true);
     const stream = await getMicStream(s);
     streamRef.current = stream;
     startAnalyser(stream);
     speechFiredRef.current = false;
+    // Fresh paste queue for this session.
+    queueRef.current = Promise.resolve();
+    pastedCountRef.current = 0;
 
     const { MicVAD } = await import('@ricky0123/vad-web');
     const vad = await MicVAD.new({
@@ -321,6 +372,12 @@ export function MicBar() {
       redemptionMs:            silenceMs,
       onSpeechEnd: async (audio: Float32Array) => {
         speechFiredRef.current = true;
+        if (liveRef.current) {
+          // Continuous: type this phrase and keep the VAD running for the next.
+          enqueueSegment(audio);
+          return;
+        }
+        // One-shot: a single utterance, then tear everything down.
         const v = micVADRef.current;
         micVADRef.current = null;
         v?.destroy().catch(() => {});
@@ -339,6 +396,25 @@ export function MicBar() {
   async function stopVADRecording() {
     const vad = micVADRef.current;
     if (!vad) return;
+
+    if (liveRef.current) {
+      // Pausing emits a final onSpeechEnd (submitUserSpeechOnPause) for any
+      // in-progress phrase; then drain the paste queue before tearing down so
+      // the last words still land.
+      micVADRef.current = null;
+      liveRef.current = false;
+      setState('processing');
+      try { await vad.pause(); } catch { /* ignore */ }
+      await Promise.resolve();          // let the final onSpeechEnd enqueue
+      try { await queueRef.current; } catch { /* ignore */ }
+      vad.destroy().catch(() => {});
+      stopAnalyser();
+      stopStream();
+      window.api.muteSystem(false);
+      setState('idle');
+      return;
+    }
+
     await vad.pause();
     if (!speechFiredRef.current) {
       micVADRef.current = null;
@@ -356,8 +432,9 @@ export function MicBar() {
     try {
       setError('');
       const s = await window.api.getSettings();
-      if (s.autoStop) await startVADRecording(s);
-      else            await startMediaRecording(s);
+      // Live dictation needs the continuous VAD even if auto-stop is off.
+      if (s.autoStop || s.liveDictation) await startVADRecording(s);
+      else                               await startMediaRecording(s);
     } catch (err: any) {
       setError(err?.message ?? 'Mic error');
       setState('error');

@@ -6,7 +6,8 @@
   "license": "MIT",
   "scripts": {
     "dev": "tauri dev",
-    "build": "tauri build",
+    "build": "node scripts/build.mjs",
+    "build:unsigned": "tauri build",
     "tauri": "tauri",
     "vite:dev": "vite",
     "vite:build": "vite build",

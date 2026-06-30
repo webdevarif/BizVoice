@@ -193,6 +193,7 @@ fn default_settings() -> Value {
         "openrouterKeyEncrypted": "",
         "customKeyEncrypted": "",
         "useBetterBangla": false,
+        "useScribe": false,
         "customBaseUrl": "",
         "customChatModel": "",
         "customHeaders": "",
@@ -205,7 +206,9 @@ fn default_settings() -> Value {
         "gptProvider": "openai",
         "sttModel": "whisper-1",
         "sttProvider": "openai",
-        "skipGpt": false,
+        // AI Formatting OFF by default: paste the exact raw transcript, and only
+        // run the GPT refine step when the user explicitly turns AI Formatting on.
+        "skipGpt": true,
         "launchOnStartup": false,
         "micDeviceId": "",
         "vocabulary": "",
@@ -213,6 +216,9 @@ fn default_settings() -> Value {
         "activeMode": "transcript",
         "silenceMs": 1200,
         "autoStop": true,
+        // Live dictation: keep the VAD running and transcribe + type each phrase
+        // the moment the user pauses, instead of one utterance then stop.
+        "liveDictation": false,
         "useLocalWhisper": false,
         "localModel": "",
         "micFallbackId": "",
@@ -462,9 +468,11 @@ pub async fn transcribe(
         custom_base_url: str_field("customBaseUrl", ""),
         custom_headers: str_field("customHeaders", ""),
         input_lang: str_field("inputLang", "auto"),
-        skip_gpt: s.get("skipGpt").and_then(|v| v.as_bool()).unwrap_or(false),
+        // Absent key → skip refine (AI Formatting defaults off), matching default_settings.
+        skip_gpt: s.get("skipGpt").and_then(|v| v.as_bool()).unwrap_or(true),
         style_prompt,
         vocabulary: str_field("vocabulary", ""),
+        use_scribe: s.get("useScribe").and_then(|v| v.as_bool()).unwrap_or(false),
         use_better_bangla: s.get("useBetterBangla").and_then(|v| v.as_bool()).unwrap_or(false),
         auth_token: decode_key(&s, "bizgrowhubTokenEncrypted"),
         api_base: api_base(),
@@ -879,12 +887,12 @@ async fn refine_via_provider(s: &Value, text: &str) -> Result<String, String> {
         return Err(format!("Refine failed (HTTP {})", resp.status()));
     }
     let data: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let refined = data
+    let raw = data
         .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
+        .unwrap_or("");
+    // Strip any "Here is the corrected sentence:"-style preamble the model leaks.
+    let refined = crate::pipeline::sanitize_refined(raw);
     if refined.is_empty() {
         return Err("Empty refinement result".into());
     }
