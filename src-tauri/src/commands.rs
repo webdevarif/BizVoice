@@ -194,6 +194,14 @@ fn settings_merge(app: &tauri::AppHandle, key: &str, value: Value) {
     let _ = store.save();
 }
 
+/// Open the webview DevTools for the window the call came from (bound to F12 in
+/// the frontend). Available because the tauri `devtools` feature is enabled in
+/// Cargo.toml (so it works in release builds too, not just `tauri dev`).
+#[tauri::command]
+pub fn open_devtools_cmd(window: tauri::WebviewWindow) {
+    window.open_devtools();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Settings & windows
 // ─────────────────────────────────────────────────────────────────────────────

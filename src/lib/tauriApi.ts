@@ -116,6 +116,14 @@ const api: Window['api'] = {
 export function installTauriApi(): void {
   if (!isTauri()) return;
   (window as any).api = api;
+  // F12 opens the webview DevTools (works in release too — the tauri `devtools`
+  // feature is enabled in Cargo.toml).
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'F12') {
+      e.preventDefault();
+      invoke('open_devtools_cmd').catch(() => {});
+    }
+  });
 }
 
 // Auto-install on import so a single `import './lib/tauriApi'` in each window's

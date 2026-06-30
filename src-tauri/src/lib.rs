@@ -192,6 +192,7 @@ pub fn run() {
             commands::open_settings,
             commands::close_window,
             commands::minimize_window,
+            commands::open_devtools_cmd,
             // Core transcribe + paste (Phase 4)
             commands::transcribe,
             commands::paste,
