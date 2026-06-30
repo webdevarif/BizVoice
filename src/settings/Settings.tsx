@@ -139,6 +139,7 @@ export function Settings() {
   const [customChatModel, setCustomChatModel] = useState('');
   const [customHeaders, setCustomHeaders] = useState('');
   const [useBetterBangla, setUseBetterBangla] = useState(false);
+  const [useScribe, setUseScribe] = useState(false);
   const [skipGpt, setSkipGpt] = useState(true); // AI Formatting off by default
   const [muteWhileRecording, setMuteWhileRecording] = useState(false);
   const [dictionary, setDictionary] = useState<DictEntry[]>([]);
@@ -223,6 +224,7 @@ export function Settings() {
       setHasCustomKey(!!s.hasCustomKey);
       if (s.hasCustomKey) setCustomKey('••••••••••••••••••••');
       setUseBetterBangla(s.useBetterBangla ?? false);
+      setUseScribe(s.useScribe ?? false);
       setSkipGpt(s.skipGpt ?? true);
       setMuteWhileRecording(s.muteWhileRecording ?? false);
       setDictionary(s.dictionary || []);
@@ -844,6 +846,20 @@ export function Settings() {
                     Bangla dictation will route to the BizGrowHub Bangla model. Other languages keep using your selected provider above. First request may take 10–30s (cold start); subsequent ones are fast.
                   </div>
                 )}
+              </Card>
+
+              {/* Premium STT — ElevenLabs Scribe via the BizGrowHub proxy.
+                  Best accuracy (incl. Bangla); same login, no extra key. */}
+              <Card>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <Label>Premium transcription (Scribe)</Label>
+                    <HelpText>
+                      Routes audio through ElevenLabs Scribe on the BizGrowHub backend — the most accurate model, especially for Bangla. No extra token; works with your login. Overrides the options above when on.
+                    </HelpText>
+                  </div>
+                  <Toggle on={useScribe} onClick={() => { const v = !useScribe; setUseScribe(v); save({ useScribe: v }, v ? 'Premium (Scribe) enabled' : 'Scribe off'); }} />
+                </div>
               </Card>
             </Section>
           )}

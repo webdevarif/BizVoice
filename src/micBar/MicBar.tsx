@@ -204,8 +204,20 @@ export function MicBar() {
   async function getMicStream(s: Awaited<ReturnType<typeof window.api.getSettings>>): Promise<MediaStream> {
     const primary  = s.micDeviceId && s.micDeviceId !== 'default' ? s.micDeviceId : undefined;
     const fallback = s.micFallbackId && s.micFallbackId !== 'default' ? s.micFallbackId : undefined;
+    // Cleaner audio -> better STT: mono, 16 kHz-ish, with the browser's DSP on
+    // (noise suppression + echo cancel + auto-gain). The VAD path already
+    // downsamples to 16 kHz; this also helps the MediaRecorder fallback path.
+    const dsp: MediaTrackConstraints = {
+      channelCount: 1,
+      sampleRate: 16000,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    };
     const tryGet = (id?: string) =>
-      navigator.mediaDevices.getUserMedia({ audio: id ? { deviceId: { exact: id } } : true });
+      navigator.mediaDevices.getUserMedia({
+        audio: id ? { deviceId: { exact: id }, ...dsp } : { ...dsp },
+      });
     try {
       return await tryGet(primary);
     } catch {

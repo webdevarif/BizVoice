@@ -25,6 +25,7 @@ pub struct PipelineOpts {
     pub skip_gpt: bool,
     pub style_prompt: String,
     pub vocabulary: String,      // custom terms/names → Whisper STT prompt bias
+    pub use_scribe: bool,        // premium ElevenLabs Scribe STT via the proxy
     pub use_better_bangla: bool, // route Bangla through BizGrowHub's tuned ASR
     pub auth_token: String,      // BizGrowHub JWT (auth for the Bangla proxy)
     pub api_base: String,        // BizGrowHub base URL (e.g. https://bizgrowhub.shop)
@@ -70,6 +71,24 @@ pub async fn run_pipeline(opts: PipelineOpts) -> Result<String, String> {
 
     let client = reqwest::Client::new();
     let iso = to_iso(&opts.input_lang);
+
+    // ── Premium STT — ElevenLabs Scribe via the BizGrowHub proxy ───────────
+    // Best-in-class accuracy. Takes priority over the other STT paths when on
+    // and the user is signed in. No fallback: the user chose premium, so we
+    // surface failures instead of silently dropping to a weaker model.
+    if opts.use_scribe && !opts.auth_token.is_empty() {
+        let raw = scribe_stt(&client, &opts, &bytes).await?;
+        let raw = raw.trim().to_string();
+        #[cfg(debug_assertions)]
+        eprintln!("[stt] scribe raw = {raw:?}");
+        if raw.is_empty() {
+            return Ok(String::new());
+        }
+        if opts.skip_gpt {
+            return Ok(raw);
+        }
+        return Ok(gpt_refine(&opts, raw).await);
+    }
 
     // ── Improved Bangla transcription ──────────────────────────────────────
     // When the user enables it AND is speaking Bangla AND is signed in, route
@@ -194,6 +213,50 @@ async fn better_bangla_stt(
         let body = resp.text().await.unwrap_or_default();
         let snippet: String = body.chars().take(200).collect();
         return Err(format!("Bangla STT failed ({status}): {snippet}"));
+    }
+
+    let data: Value = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(data
+        .get("transcript")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string())
+}
+
+/// Transcribe via ElevenLabs Scribe through the BizGrowHub proxy
+/// (POST /api/bizvoice/transcribe-scribe, authed with the user's JWT). Best
+/// Bangla accuracy; the language hint comes from the app's input_lang.
+async fn scribe_stt(
+    client: &reqwest::Client,
+    opts: &PipelineOpts,
+    audio: &[u8],
+) -> Result<String, String> {
+    let url = format!(
+        "{}/api/bizvoice/transcribe-scribe",
+        opts.api_base.trim_end_matches('/')
+    );
+    let part = reqwest::multipart::Part::bytes(audio.to_vec())
+        .file_name("audio.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| e.to_string())?;
+    let form = reqwest::multipart::Form::new()
+        .text("language", opts.input_lang.to_lowercase())
+        .part("file", part);
+
+    let resp = client
+        .post(&url)
+        .bearer_auth(&opts.auth_token)
+        .multipart(form)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .map_err(|e| format!("Scribe STT request failed: {e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(200).collect();
+        return Err(format!("Scribe STT failed ({status}): {snippet}"));
     }
 
     let data: Value = resp.json().await.map_err(|e| e.to_string())?;
