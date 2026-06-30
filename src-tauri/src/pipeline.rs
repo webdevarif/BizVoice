@@ -307,18 +307,27 @@ pub async fn gpt_refine(opts: &PipelineOpts, raw: String) -> String {
             _ => return raw, // no usable GPT provider — return the raw transcription
         };
 
-    // For "Banglish" input the user speaks Bangla but wants Roman-letter output.
-    // STT already recognized it as Bangla; transliterate it here in the refine step.
-    let system_prompt = if opts.input_lang.eq_ignore_ascii_case("banglish") {
-        format!(
-            "{}\n\nThen write the result in Banglish — transliterate the Bangla into \
-             English/Roman letters (e.g. 'আমি ভালো আছি' -> 'ami valo achi'). \
+    // Language-aware refine guidance. Bengali STT output is phonetically rough,
+    // so nudge the model to normalize to standard Bangla without changing meaning.
+    // For "Banglish" input the user speaks Bangla but wants Roman-letter output,
+    // so additionally transliterate the corrected text.
+    let is_bangla = matches!(to_iso(&opts.input_lang).as_deref(), Some("bn"));
+    let mut system_prompt = opts.style_prompt.clone();
+    if is_bangla {
+        system_prompt.push_str(
+            "\n\nThis is Bengali speech-to-text output. Correct phonetic/spelling \
+             mistakes to standard Bangla (e.g. আছা→আচ্ছা, খুপ→খুব, শুন্দর→সুন্দর, কাস→কাজ) \
+             and fix word boundaries + punctuation. Do NOT change the meaning, add or \
+             drop content, or translate. Keep any English words exactly as spoken.",
+        );
+    }
+    if opts.input_lang.eq_ignore_ascii_case("banglish") {
+        system_prompt.push_str(
+            "\n\nThen transliterate the corrected Bangla into Banglish — Roman/English \
+             letters the way Bangladeshis text (e.g. 'আমি ভালো আছি' -> 'ami valo achi'). \
              Output ONLY the Banglish text, with no Bangla script.",
-            opts.style_prompt
-        )
-    } else {
-        opts.style_prompt.clone()
-    };
+        );
+    }
 
     // Try the configured model first, then provider-specific fallbacks, so a
     // single dead/rate-limited free model (e.g. today's gemini-2.0-flash-exp:free
