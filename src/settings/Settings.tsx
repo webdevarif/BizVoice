@@ -127,9 +127,9 @@ export function Settings() {
   const [whisperModels, setWhisperModels] = useState<{ name: string; size: string; downloaded: boolean }[]>([]);
   const [downloading, setDownloading] = useState<string | null>(null);
   const [downloadPct, setDownloadPct] = useState(0);
-  // sttProvider value isn't read in this component — the unified picker drives
-  // gptProvider, and sttProvider is set as a derived backend hint via setSttProvider.
-  const [, setSttProvider] = useState<'openai' | 'groq'>('openai');
+  // sttProvider is the cloud STT backend hint (groq/openai); the unified picker
+  // drives it + gptProvider. Read for the "Active pipeline" status line.
+  const [sttProvider, setSttProvider] = useState<'openai' | 'groq'>('openai');
   const [gptProvider, setGptProvider] = useState<'openai' | 'groq' | 'openrouter' | 'custom'>('openai');
   const [openrouterKey, setOpenrouterKey] = useState('');
   const [hasOpenrouterKey, setHasOpenrouterKey] = useState(false);
@@ -419,6 +419,19 @@ export function Settings() {
     !dictSearch.trim() || (d.from + d.to + (d.category || '')).toLowerCase().includes(dictSearch.toLowerCase())
   );
 
+  // "Active pipeline" status — mirrors the Rust STT-selection priority so the
+  // user can always see which model will actually run for the current settings.
+  const langIsBangla = /^(bangla|banglish|bn)$/i.test(inputLang);
+  const activeStt =
+    useScribe ? 'ElevenLabs Scribe (premium)'
+    : (useBetterBangla && langIsBangla) ? 'Improved Bangla (BanglaASR)'
+    : useLocalWhisper ? `Local Whisper (${localModel})`
+    : sttProvider === 'groq' ? 'Groq · whisper-large-v3'
+    : `OpenAI · ${sttModel}`;
+  const refineLabel = skipGpt
+    ? 'Off — raw transcript'
+    : `${gptProvider === 'groq' ? 'Groq' : gptProvider === 'openrouter' ? 'OpenRouter' : gptProvider === 'custom' ? 'Custom' : 'OpenAI'} · ${gptProvider === 'custom' ? (customChatModel || gptModel) : gptModel}`;
+
   return (
     <div className="h-screen flex flex-col text-white" style={{ background: 'linear-gradient(135deg, #0f0f15 0%, #15151d 100%)' }}>
       <div className="flex-1 flex min-h-0">
@@ -511,6 +524,18 @@ export function Settings() {
           {/* ── GENERAL ── */}
           {tab === 'general' && (
             <Section title="Transcription" description="Choose how BizVoice converts your speech to text.">
+              {/* Active pipeline — what will actually run given all the toggles. */}
+              <Card>
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-white/40">Recognition (STT)</span>
+                  <span className="font-mono text-emerald-400">{activeStt}</span>
+                </div>
+                <div className="flex items-center justify-between text-[11px] mt-1.5">
+                  <span className="text-white/40">AI cleanup</span>
+                  <span className={`font-mono ${skipGpt ? 'text-white/40' : 'text-blue-400'}`}>{refineLabel}</span>
+                </div>
+              </Card>
+
               {/* Mode cards */}
               <div className="grid grid-cols-2 gap-3">
                 <ModeCard
