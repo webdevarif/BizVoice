@@ -84,7 +84,9 @@ pub async fn run_pipeline(opts: PipelineOpts) -> Result<String, String> {
         if raw.is_empty() {
             return Ok(String::new());
         }
-        if opts.skip_gpt {
+        // Banglish needs the LLM to romanize, so it always refines even when
+        // "AI Formatting" is off — otherwise you'd get raw Bangla script.
+        if opts.skip_gpt && !opts.input_lang.eq_ignore_ascii_case("banglish") {
             return Ok(raw);
         }
         return Ok(gpt_refine(&opts, raw).await);
@@ -104,7 +106,9 @@ pub async fn run_pipeline(opts: PipelineOpts) -> Result<String, String> {
         if raw.is_empty() {
             return Ok(String::new());
         }
-        if opts.skip_gpt {
+        // Banglish needs the LLM to romanize, so it always refines even when
+        // "AI Formatting" is off — otherwise you'd get raw Bangla script.
+        if opts.skip_gpt && !opts.input_lang.eq_ignore_ascii_case("banglish") {
             return Ok(raw);
         }
         return Ok(gpt_refine(&opts, raw).await);
@@ -169,7 +173,9 @@ pub async fn run_pipeline(opts: PipelineOpts) -> Result<String, String> {
     if raw.is_empty() {
         return Ok(String::new());
     }
-    if opts.skip_gpt {
+    // Banglish needs the LLM to romanize, so it always refines even when
+    // "AI Formatting" is off — otherwise you'd get raw Bangla script.
+    if opts.skip_gpt && !opts.input_lang.eq_ignore_ascii_case("banglish") {
         return Ok(raw);
     }
     Ok(gpt_refine(&opts, raw).await)
