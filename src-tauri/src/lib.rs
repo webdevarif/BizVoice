@@ -170,6 +170,7 @@ pub fn run() {
         .manage(paste::PasteWorker::default())
         .manage(whisper::WhisperCache::default())
         .manage(commands::PendingUpdate::default())
+        .manage(commands::StreamSessions::default())
         .setup(|app| {
             // Register the user's configured hotkeys (toggle / PTT / cycle) read
             // from settings, recording them in HotkeyState for the handler above.
@@ -223,7 +224,12 @@ pub fn run() {
             commands::update_info,
             commands::update_download,
             commands::update_install,
-            commands::update_later
+            commands::update_later,
+            // Live streaming (VoiceEngine)
+            commands::start_stream_session,
+            commands::stream_audio_chunk,
+            commands::end_stream_session,
+            commands::open_voice_engine
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

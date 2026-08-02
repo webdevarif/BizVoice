@@ -60,6 +60,19 @@
         "shadow": false,
         "focus": false,
         "visible": false
+      },
+      {
+        "label": "voiceengine",
+        "url": "voiceEngine.html",
+        "title": "BizVoice — Live Transcript",
+        "width": 900,
+        "height": 680,
+        "minWidth": 620,
+        "minHeight": 480,
+        "decorations": true,
+        "resizable": true,
+        "center": true,
+        "visible": false
       }
     ],
     "security": {

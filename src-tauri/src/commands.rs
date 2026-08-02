@@ -253,6 +253,7 @@ fn default_settings() -> Value {
         "stats": { "recordings": 0, "words": 0, "durationMs": 0 },
         "bizgrowhubTokenEncrypted": "",
         "bizgrowhubEmail": "",
+        "bizgrowhubName": "",
         "licenseOkAt": 0
     })
 }
@@ -387,13 +388,65 @@ pub fn show_login(app: &tauri::AppHandle) {
 /// Fast, offline local license check used to pick the startup/tray window:
 /// a stored token plus a `licenseOkAt` inside the 7-day grace. The authoritative
 /// network re-check runs in `auth_status` (called by the frontend on mount).
+///
+/// As a fallback for users who signed in during an older build that never wrote
+/// `licenseOkAt`, we also peek into the stored JWT: if it has an `exp` claim and
+/// that claim lies in the future, the token itself is authoritative proof of a
+/// valid login — we treat it as locally licensed and immediately backfill
+/// `licenseOkAt` so subsequent boots don't re-decode the JWT.
 pub fn local_license_ok(app: &tauri::AppHandle) -> bool {
     let Ok(store) = app.store(SETTINGS_STORE) else {
         return false;
     };
+    // Force a reload from disk on the first check (the plugin caches in mem
+    // between API calls but load() guarantees we read what was last saved).
+    let _ = store.reload();
     let s = store.get(SETTINGS_KEY).unwrap_or_else(default_settings);
     let has_token = !decode_key(&s, "bizgrowhubTokenEncrypted").is_empty();
     let ok_at = s.get("licenseOkAt").and_then(|v| v.as_i64()).unwrap_or(0);
+    if !has_token {
+        return false;
+    }
+    if ok_at > 0 && (now_ms() - ok_at) < 7 * 24 * 60 * 60 * 1000 {
+        return true;
+    }
+    // Fallback: valid unexpired JWT → still good enough for local gating.
+    // Decode once, backfill ok_at so this branch is skipped on every next boot.
+    let token = decode_key(&s, "bizgrowhubTokenEncrypted");
+    if !token.is_empty() {
+        use base64::Engine;
+        let maybe_exp = token
+            .split('.')
+            .nth(1)
+            .and_then(|middle| {
+                let padded = match middle.len() % 4 {
+                    0 => middle.to_string(),
+                    2 => format!("{middle}=="),
+                    3 => format!("{middle}="),
+                    _ => middle.to_string(),
+                };
+                let url_standard: String = padded
+                    .chars()
+                    .map(|c| match c {
+                        '-' => '+',
+                        '_' => '/',
+                        other => other,
+                    })
+                    .collect();
+                base64::engine::general_purpose::STANDARD
+                    .decode(url_standard.as_bytes())
+                    .ok()
+            })
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|claims| claims.get("exp").and_then(|v| v.as_i64()));
+        if let Some(exp_s) = maybe_exp {
+            let exp_ms = exp_s * 1000;
+            if exp_ms > now_ms() {
+                settings_merge(app, "licenseOkAt", json!(now_ms()));
+                return true;
+            }
+        }
+    }
     has_token && ok_at > 0 && (now_ms() - ok_at) < 7 * 24 * 60 * 60 * 1000
 }
 
@@ -1111,10 +1164,23 @@ pub fn start_browser_login(app: tauri::AppHandle) -> Result<Value, String> {
 
     let app2 = app.clone();
     std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 8192];
+        let expected_state = state;
+        // Accept up to ~10 incoming attempts before giving up. Handles the
+        // common case where:
+        //   • browser sends GET /favicon.ico before the real /callback redirect,
+        //   • CORS preflight OPTIONS request lands ahead of the real payload,
+        //   • user refreshes the success page and triggers a second GET.
+        for _ in 0..10 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let mut buf = [0u8; 16384];
             let n = stream.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                continue;
+            }
             let req = String::from_utf8_lossy(&buf[..n]);
+            let method = req.lines().next().unwrap_or("").split_whitespace().next().unwrap_or("");
             let path = req
                 .lines()
                 .next()
@@ -1122,42 +1188,147 @@ pub fn start_browser_login(app: tauri::AppHandle) -> Result<Value, String> {
                 .split_whitespace()
                 .nth(1)
                 .unwrap_or("");
+
+            // Silently short-circuit favicon / static probes that browsers
+            // fire automatically — they shouldn't consume the callback.
+            if path.starts_with("/favicon") || path == "/robots.txt" {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
+
+            // CORS preflight: modern browsers send OPTIONS before an XHR/fetch
+            // from HTTPS bizgrowhub.shop → HTTP localhost. Without Access-Control
+            // headers the subsequent real callback is BLOCKED by the browser.
+            if method == "OPTIONS" {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
+
             let (token, st) = parse_callback(path);
-            let ok = !token.is_empty() && st == state;
+            let ok = !token.is_empty() && st == expected_state;
+
+            // Always include permissive CORS headers on the response too, so
+            // even if the page uses XHR/fetch (not top-level navigate) the
+            // browser can read the success body.
+            let cors = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Credentials: true\r\n";
 
             let body = if ok {
                 "<h2>BizVoice connected \u{2713}</h2><p>You can close this tab and return to the app.</p>"
+            } else if !token.is_empty() {
+                "<h2>Invalid sign-in</h2><p>State mismatch — please retry from the BizVoice app.</p>"
             } else {
-                "<h2>Invalid sign-in</h2><p>Please retry from the BizVoice app.</p>"
+                // Waiting page — probably just favicon / preflight noise
+                // that slipped past, so keep the listener alive for another
+                // attempt instead of surfacing a scary error.
+                "<h2>Waiting for sign-in…</h2><p>If this page stays open, go back to BizVoice and click Sign In again.</p>"
             };
             let html = format!(
                 "<!doctype html><html><body style=\"font-family:system-ui;background:#0A0A0F;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0\"><div style=\"text-align:center\">{body}</div></body></html>"
             );
+            let status = if ok {
+                "HTTP/1.1 200 OK"
+            } else if !token.is_empty() {
+                "HTTP/1.1 403 Forbidden"
+            } else {
+                "HTTP/1.1 200 OK"
+            };
             let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                html.len(),
-                html
+                "{status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len}\r\n{cors}Connection: close\r\n\r\n{html}",
+                len = html.len(),
+                cors = cors,
+                status = status,
+                html = html,
             );
             let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+            drop(stream);
 
             if ok {
+                // ── FIX A: persist token + license grace + email in ONE step.
+                // Previously we only saved the token here and relied on a
+                // successful `auth_status()` network call to backfill
+                // `licenseOkAt`.  If that call timed out or the user restarted
+                // the app *before* it ran, `local_license_ok` would return
+                // false on next boot and force the user through login again
+                // even though the token is perfectly valid.
+                let (email, name) = decode_jwt_claims(&token);
                 {
                     use base64::Engine;
                     let enc = base64::engine::general_purpose::STANDARD.encode(token.as_bytes());
-                    // Store INSIDE the settings object (where all readers look).
                     settings_merge(&app2, "bizgrowhubTokenEncrypted", json!(enc));
                 }
+                // The token was just minted by BizGrowHub → treat the current
+                // millisecond as the start of the 7-day offline grace window.
+                settings_merge(&app2, "licenseOkAt", json!(now_ms()));
+                if !email.is_empty() {
+                    settings_merge(&app2, "bizgrowhubEmail", json!(email));
+                }
+                if !name.is_empty() {
+                    settings_merge(&app2, "bizgrowhubName", json!(name));
+                }
+
                 let _ = app2.emit(
                     "auth:changed",
-                    json!({ "active": true, "loggedIn": true, "email": "" }),
+                    json!({ "active": true, "loggedIn": true, "email": email, "name": name }),
                 );
-                // Reveal the mic bar / dismiss login on a successful sign-in.
                 on_licensed(&app2);
+                break;
+            }
+            // state mismatch with a token = abort, don't accept more attempts.
+            if !token.is_empty() {
+                break;
             }
         }
     });
 
     Ok(json!({ "ok": true }))
+}
+
+/// Pull email + display name out of the middle base64url payload of a JWT.
+/// Returns ("", "") on any parse failure (callers fall back to "Signed in" + ?).
+fn decode_jwt_claims(token: &str) -> (String, String) {
+    use base64::Engine;
+    let middle = match token.split('.').nth(1) {
+        Some(m) => m,
+        None => return (String::new(), String::new()),
+    };
+    // JWT payloads use base64url (-_), not standard (+/). Pad to a multiple of
+    // 4 bytes so the decoder doesn't reject short payloads.
+    let padded = match middle.len() % 4 {
+        0 => middle.to_string(),
+        2 => format!("{middle}=="),
+        3 => format!("{middle}="),
+        _ => middle.to_string(),
+    };
+    let url_standard: String = padded.chars().map(|c| match c {
+        '-' => '+',
+        '_' => '/',
+        other => other,
+    }).collect();
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(url_standard.as_bytes()) else {
+        return (String::new(), String::new());
+    };
+    let Ok(json) = serde_json::from_slice::<Value>(&bytes) else {
+        return (String::new(), String::new());
+    };
+    let email = json
+        .get("email")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    // Common claim names for display name (in order of BizGrowHub likelihood).
+    let name = json
+        .get("name")
+        .and_then(|v| v.as_str())
+        .or_else(|| json.get("displayName").and_then(|v| v.as_str()))
+        .or_else(|| json.get("full_name").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+    (email, name)
 }
 
 /// Parse `token` and `state` from a `/callback?token=..&state=..` path.
@@ -1215,10 +1386,16 @@ pub fn cancel_browser_login() -> Value {
 pub fn logout(app: tauri::AppHandle) -> Result<Value, String> {
     settings_merge(&app, "bizgrowhubTokenEncrypted", json!(""));
     settings_merge(&app, "licenseOkAt", json!(0));
+    settings_merge(&app, "bizgrowhubEmail", json!(""));
+    settings_merge(&app, "bizgrowhubName", json!(""));
     if let Some(w) = app.get_webview_window("micbar") {
         let _ = w.hide();
     }
-    // Return the user to the sign-in window (mirrors the re-lock in index.ts).
+    use tauri::Emitter;
+    let _ = app.emit(
+        "auth:changed",
+        json!({ "active": false, "loggedIn": false, "email": "", "name": "" }),
+    );
     show_login(&app);
     Ok(json!({ "ok": true }))
 }
@@ -1242,14 +1419,36 @@ pub async fn auth_status(app: tauri::AppHandle) -> Result<Value, String> {
     let store = app.store(SETTINGS_STORE).map_err(|e| e.to_string())?;
     let s = store.get(SETTINGS_KEY).unwrap_or_else(default_settings);
     let token = decode_key(&s, "bizgrowhubTokenEncrypted");
-    let email = s
+    if token.is_empty() {
+        return Ok(json!({ "loggedIn": false, "active": false, "email": "", "name": "" }));
+    }
+
+    // ── Back-compat fill: users who signed in before the JWT-claim decode
+    //    change landed have bizgrowhubEmail == "" even though their token
+    //    contains the email.  Pull email/name out of the stored JWT once and
+    //    persist so the UI shows them without a network round-trip.
+    let stored_email = s
         .get("bizgrowhubEmail")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    if token.is_empty() {
-        return Ok(json!({ "loggedIn": false, "active": false, "email": "" }));
+    let stored_name = s
+        .get("bizgrowhubName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let (jwt_email, jwt_name) = decode_jwt_claims(&token);
+    let mut email = stored_email.clone();
+    let mut name = stored_name.clone();
+    if email.is_empty() && !jwt_email.is_empty() {
+        email = jwt_email.clone();
+        settings_merge(&app, "bizgrowhubEmail", json!(jwt_email));
     }
+    if name.is_empty() && !jwt_name.is_empty() {
+        name = jwt_name.clone();
+        settings_merge(&app, "bizgrowhubName", json!(jwt_name));
+    }
+
     let resp = reqwest::Client::new()
         .get(format!("{}/api/bizvoice/license", api_base()))
         .bearer_auth(&token)
@@ -1259,16 +1458,44 @@ pub async fn auth_status(app: tauri::AppHandle) -> Result<Value, String> {
     match resp {
         Ok(r) if r.status().as_u16() == 401 => {
             settings_merge(&app, "bizgrowhubTokenEncrypted", json!(""));
-            Ok(json!({ "loggedIn": false, "active": false, "email": "" }))
+            settings_merge(&app, "licenseOkAt", json!(0));
+            settings_merge(&app, "bizgrowhubEmail", json!(""));
+            settings_merge(&app, "bizgrowhubName", json!(""));
+            if let Some(w) = app.get_webview_window("micbar") {
+                let _ = w.hide();
+            }
+            {
+                use tauri::Emitter;
+                let _ = app.emit(
+                    "auth:changed",
+                    json!({ "active": false, "loggedIn": false, "email": "", "name": "" }),
+                );
+            }
+            show_login(&app);
+            Ok(json!({ "loggedIn": false, "active": false, "email": "", "name": "" }))
         }
         Ok(r) if r.status().is_success() => {
             let data: Value = r.json().await.unwrap_or_else(|_| json!({}));
             let active = data.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+            // If the license endpoint sends us fresher profile info
+            // (email/name) than what we cached from the JWT, prefer it.
+            if let Some(v) = data.get("email").and_then(|v| v.as_str()) {
+                if !v.is_empty() && v != email.as_str() {
+                    email = v.to_string();
+                    settings_merge(&app, "bizgrowhubEmail", json!(email));
+                }
+            }
+            if let Some(v) = data.get("name").and_then(|v| v.as_str()) {
+                if !v.is_empty() && v != name.as_str() {
+                    name = v.to_string();
+                    settings_merge(&app, "bizgrowhubName", json!(name));
+                }
+            }
             if active {
                 settings_merge(&app, "licenseOkAt", json!(now_ms()));
                 on_licensed(&app);
             }
-            Ok(json!({ "loggedIn": true, "active": active, "email": email }))
+            Ok(json!({ "loggedIn": true, "active": active, "email": email, "name": name }))
         }
         _ => {
             // Offline grace: trust the last successful check for 7 days.
@@ -1277,7 +1504,7 @@ pub async fn auth_status(app: tauri::AppHandle) -> Result<Value, String> {
             if active {
                 on_licensed(&app);
             }
-            Ok(json!({ "loggedIn": true, "active": active, "email": email, "offline": true }))
+            Ok(json!({ "loggedIn": true, "active": active, "email": email, "name": name, "offline": true }))
         }
     }
 }
@@ -1429,4 +1656,674 @@ pub fn update_later(window: Window) {
     if let Some(w) = window.get_webview_window("update") {
         let _ = w.close();
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Live streaming (VoiceEngine) — 3-Tier Hybrid Transcription
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Tier 1 (LIVE PARTIAL, blue text):
+//   Every ~2s of accumulated audio, run the FASTEST available STT engine
+//   (Groq / Local Whisper / OpenAI fallback). Scribe and ImprovedBangla are
+//   explicitly SKIPPED here because their batch BizGrowHub proxies have 10-60s
+//   latency. No GPT refine — raw STT is fine for a live tentative preview.
+//   → emits `transcript:partial`
+//
+// Tier 2 (ACCURATE FINAL, black text):
+//   Triggered by EITHER:
+//     (a) VAD silence heuristic: ~3.5s since the last "meaningful" partial
+//         (user paused speaking). Runs the premium-accurate pipeline on the
+//         utterance accumulated so far, locks it in as final, then resets the
+//         rolling buffer for the next utterance.
+//     (b) is_final=true from the frontend (user pressed Stop). Same accurate
+//         pipeline, but clears the whole session.
+//   Respects ALL user settings: Scribe → ImprovedBangla (for Bangla) → provider.
+//   → emits `transcript:final`
+//
+// Tier 3 (misc):
+//   • dedupe: never run two partial/final jobs in parallel for the same session.
+//   • silence gate: tiny/empty partials don't reset the "last voice" timestamp.
+//
+use std::collections::HashMap;
+use std::sync::Mutex as StdMutex;
+
+/// Minimum bytes to accumulate before we're willing to kick off a fast partial
+/// pass.  Kept deliberately small: one ~500 ms 16 kHz mono 16-bit WAV chunk is
+/// roughly 16 KB, so one single chunk is enough to start.  We want the user to
+/// see SOMETHING within ~1 s of starting to talk.
+const MIN_PARTIAL_BYTES: usize = 14_000;
+/// Minimum wall-clock gap between successive partial passes.  The provider-side
+/// Whisper inference itself is ~0.7-1.2 s for short clips on Groq, so a ~900 ms
+/// cadence means we're effectively streaming: next result comes back almost as
+/// soon as the previous one rendered.  Google Live Transcribe targets ~300 ms;
+/// 900 ms is the sweet spot between API rate limits and perceived live-ness.
+const PARTIAL_INTERVAL_MS: i64 = 900;
+/// Silence = "user finished this sentence".  Tuned quite tight: natural Bangla
+/// speech has ~150-400 ms gaps between words, so anything >1.8 s without a
+/// *new* meaningful partial is almost certainly the end of an utterance.  We
+/// used to wait 3.5 s which felt like forever.
+const SILENCE_TRIGGER_MS: i64 = 1800;
+/// Minimum transcript length (chars) we consider "actual voice" for the
+/// silence heuristic. Short blips ("ok", "uh", "ওহে") are ignored.
+const MIN_MEANINGFUL_LEN: usize = 4;
+
+#[derive(Default)]
+pub(crate) struct StreamSession {
+    /// All WAV chunks received since the last "final utterance boundary".
+    /// Gets cleared after a silence-triggered final pass so the next sentence
+    /// starts with a clean buffer (stop-triggered final removes the session).
+    chunks: Vec<Vec<u8>>,
+    /// Language the USER PICKED in the VoiceEngine dropdown — NOT the global
+    /// settings `input_lang` default.  We ALWAYS prefer this over settings for
+    /// live work, otherwise "Bangla" chosen in the window is silently ignored
+    /// and Whisper wastes 500+ ms on auto-detect (often guessing English).
+    language: String,
+    provider: String,
+    model: String,
+    /// `now_ms()` timestamp of the last partial STT we actually kicked off
+    /// (used with PARTIAL_INTERVAL_MS to rate-limit).
+    last_partial_ms: i64,
+    /// `now_ms()` timestamp of the last partial result that exceeded
+    /// MIN_MEANINGFUL_LEN (used with SILENCE_TRIGGER_MS for VAD).
+    last_voice_ms: i64,
+    /// Guards against running two in-flight STT jobs (partial or final) for
+    /// the same session.  Set to true under the lock just before spawning
+    /// the task, set back to false under the lock after the task joins.
+    in_flight: bool,
+    /// Guards against running a silence-triggered final pass more than once
+    /// while waiting for the accurate Tier-2 network round trip.  Once we
+    /// emit a final for a given chunk window we consider the utterance
+    /// "locked in" and stop re-triggering from the silence window.
+    final_pending: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct StreamSessions(pub(crate) StdMutex<HashMap<String, StreamSession>>);
+
+/// Concatenate a slice of WAV chunks into one contiguous byte buffer.
+fn concat_chunks(chunks: &[Vec<u8>]) -> Vec<u8> {
+    let total: usize = chunks.iter().map(|c| c.len()).sum();
+    let mut buf = Vec::with_capacity(total);
+    for c in chunks {
+        buf.extend(c.as_slice());
+    }
+    buf
+}
+
+/// Build a PipelineOpts from the current settings + a raw WAV buffer.
+///
+/// `force_fast_partial_mode` = true disables Scribe, ImprovedBangla, and GPT
+/// refine so the call comes back as fast as possible for Tier-1 live text.
+///
+/// `force_lang_override` = the VoiceEngine window's dropdown selection, if the
+/// user explicitly picked one there.  When non-empty it ALWAYS wins over the
+/// global settings `input_lang` default; otherwise we fall back to settings.
+fn build_opts(
+    s: &Value,
+    buf: &[u8],
+    _app: &tauri::AppHandle,
+    force_fast_partial_mode: bool,
+    force_lang_override: Option<&str>,
+) -> crate::pipeline::PipelineOpts {
+    use base64::Engine;
+    let str_field = |k: &str, default: &str| -> String {
+        match s.get(k).and_then(|v| v.as_str()) {
+            Some(v) if !v.is_empty() => v.to_string(),
+            _ => default.to_string(),
+        }
+    };
+
+    let active = str_field("activeMode", "transcript");
+    let mode_prompt = s
+        .get("modes")
+        .and_then(|m| m.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|m| m.get("id").and_then(|i| i.as_str()) == Some(active.as_str()))
+        })
+        .and_then(|m| m.get("prompt"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("Fix ONLY spelling and grammar. Output ONLY the corrected text.")
+        .to_string();
+    let instructions = s
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let style_prompt = if instructions.is_empty() {
+        mode_prompt
+    } else {
+        format!("{mode_prompt}\n\nAdditional user instructions: {instructions}")
+    };
+
+    let gpt_provider = str_field("gptProvider", "openai");
+    let gpt_model = if gpt_provider == "custom" {
+        let cm = str_field("customChatModel", "");
+        if cm.is_empty() {
+            str_field("gptModel", "gpt-4o-mini")
+        } else {
+            cm
+        }
+    } else {
+        str_field("gptModel", "gpt-4o-mini")
+    };
+
+    let (use_scribe, use_better_bangla, skip_gpt) = if force_fast_partial_mode {
+        (false, false, true)
+    } else {
+        (
+            s.get("useScribe").and_then(|v| v.as_bool()).unwrap_or(false),
+            s.get("useBetterBangla")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            s.get("skipGpt").and_then(|v| v.as_bool()).unwrap_or(true),
+        )
+    };
+
+    // CRITICAL for perceived speed: VoiceEngine dropdown > global settings.
+    // Without this, a user who picked "Bangla (বাংলা)" in the live window
+    // gets auto-detect, and Whisper wastes 300-800 ms disambiguating, often
+    // landing on English first and emitting a wrong partial.
+    let settings_lang = str_field("inputLang", "auto");
+    let input_lang = match force_lang_override {
+        Some(v) if !v.trim().is_empty() && v != "auto" => v.trim().to_string(),
+        _ => settings_lang,
+    };
+
+    // Custom vocabulary (names/jargon like "Next.js, Supabase, Prisma") is a
+    // useful STT prompt bias but adds form-building overhead; for live
+    // partials we skip it — the ~50 ms saved per call × 20 calls/min helps.
+    let vocabulary = if force_fast_partial_mode {
+        String::new()
+    } else {
+        str_field("vocabulary", "")
+    };
+
+    crate::pipeline::PipelineOpts {
+        audio_base64: base64::engine::general_purpose::STANDARD.encode(buf),
+        openai_key: decode_key(s, "openaiKeyEncrypted"),
+        groq_key: decode_key(s, "groqKeyEncrypted"),
+        stt_provider: str_field("sttProvider", "openai"),
+        stt_model: str_field("sttModel", "whisper-1"),
+        gpt_provider,
+        gpt_model,
+        openrouter_key: decode_key(s, "openrouterKeyEncrypted"),
+        custom_key: decode_key(s, "customKeyEncrypted"),
+        custom_base_url: str_field("customBaseUrl", ""),
+        custom_headers: str_field("customHeaders", ""),
+        input_lang,
+        skip_gpt,
+        style_prompt,
+        vocabulary,
+        use_scribe,
+        use_better_bangla,
+        auth_token: decode_key(s, "bizgrowhubTokenEncrypted"),
+        api_base: api_base(),
+    }
+}
+
+/// Tier 1 — fast partial STT. Returns the raw transcript text.
+///
+/// Priority order (fastest → slowest):
+///   1. Local Whisper tiny/base (no network at all) if configured + downloaded
+///   2. Groq whisper-large-v3 when a Groq key is present (~1s cloud STT)
+///   3. OpenAI whisper-1 as last resort
+///
+/// Falls back to Ok("") when no provider has credentials available.
+/// `pref_lang` comes from `StreamSession.language` set by the VoiceEngine start
+/// call and overrides any global default.
+async fn run_fast_partial(
+    app: &tauri::AppHandle,
+    buf: Vec<u8>,
+    s: Value,
+    pref_lang: String,
+) -> Result<String, String> {
+    let str_field = |k: &str, default: &str| -> String {
+        match s.get(k).and_then(|v| v.as_str()) {
+            Some(v) if !v.is_empty() => v.to_string(),
+            _ => default.to_string(),
+        }
+    };
+
+    // Apply the same dropdown > settings precedence here too.
+    let resolved_lang = if pref_lang.trim().is_empty() || pref_lang == "auto" {
+        str_field("inputLang", "auto")
+    } else {
+        pref_lang.clone()
+    };
+
+    // 1) Local whisper?
+    let use_local = s
+        .get("useLocalWhisper")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let local_model = str_field("localModel", "");
+    let local_path = if use_local && !local_model.is_empty() {
+        model_file(&local_model).and_then(|f| {
+            let p = whisper_dir(app).ok()?.join(f);
+            p.exists().then_some(p)
+        })
+    } else {
+        None
+    };
+    if let Some(model_path) = local_path {
+        let cache = app.state::<crate::whisper::WhisperCache>().inner().clone();
+        let mp = model_path.to_string_lossy().to_string();
+        let lang = resolved_lang.clone();
+        return tauri::async_runtime::spawn_blocking(move || {
+            cache.transcribe_local(&mp, &buf, Some(&lang))
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r);
+    }
+
+    // 2) Groq? (fastest cloud STT — whisper-large-v3, ~1s latency)
+    let groq_key = decode_key(&s, "groqKeyEncrypted");
+    if !groq_key.is_empty() {
+        let mut opts = build_opts(&s, &buf, app, true, Some(&pref_lang));
+        opts.stt_provider = "groq".to_string();
+        opts.stt_model = "whisper-large-v3".to_string();
+        // Force-set language explicitly — Groq's Whisper benefits hugely from
+        // a pinned "bn" for Bangla clips instead of auto-detect.
+        if !resolved_lang.is_empty() && resolved_lang != "auto" {
+            opts.input_lang = resolved_lang.clone();
+        }
+        if opts.groq_key.is_empty() {
+            opts.groq_key = groq_key;
+        }
+        return crate::pipeline::run_pipeline(opts).await;
+    }
+
+    // 3) OpenAI whisper-1 fallback.
+    let openai_key = decode_key(&s, "openaiKeyEncrypted");
+    if !openai_key.is_empty() {
+        let mut opts = build_opts(&s, &buf, app, true, Some(&pref_lang));
+        opts.stt_provider = "openai".to_string();
+        if !resolved_lang.is_empty() && resolved_lang != "auto" {
+            opts.input_lang = resolved_lang.clone();
+        }
+        if opts.openai_key.is_empty() {
+            opts.openai_key = openai_key;
+        }
+        return crate::pipeline::run_pipeline(opts).await;
+    }
+
+    Ok(String::new())
+}
+
+/// Tier 2 — accurate final STT. Uses the EXISTING full `run_pipeline` contract
+/// exactly as the old code did: respects Scribe → ImprovedBangla → user STT
+/// provider priority AND runs GPT refine / dictionary post-processing.
+async fn run_accurate_final(
+    app: &tauri::AppHandle,
+    buf: Vec<u8>,
+    s: Value,
+    pref_lang: String,
+) -> Result<String, String> {
+    let str_field = |k: &str, default: &str| -> String {
+        match s.get(k).and_then(|v| v.as_str()) {
+            Some(v) if !v.is_empty() => v.to_string(),
+            _ => default.to_string(),
+        }
+    };
+
+    let use_local = s
+        .get("useLocalWhisper")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let local_model = str_field("localModel", "");
+    let local_path = if use_local && !local_model.is_empty() {
+        model_file(&local_model).and_then(|f| {
+            let p = whisper_dir(app).ok()?.join(f);
+            p.exists().then_some(p)
+        })
+    } else {
+        None
+    };
+
+    let opts = build_opts(&s, &buf, app, false, Some(&pref_lang));
+    if let Some(model_path) = local_path {
+        let cache = app.state::<crate::whisper::WhisperCache>().inner().clone();
+        let mp = model_path.to_string_lossy().to_string();
+        let lang = opts.input_lang.clone();
+        let raw_res = tauri::async_runtime::spawn_blocking(move || {
+            cache.transcribe_local(&mp, &buf, Some(&lang))
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r);
+        return match raw_res {
+            Ok(raw) => {
+                if raw.is_empty() || opts.skip_gpt {
+                    Ok(raw)
+                } else {
+                    Ok(crate::pipeline::gpt_refine(&opts, raw).await)
+                }
+            }
+            Err(e) => Err(e),
+        };
+    }
+    crate::pipeline::run_pipeline(opts).await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn start_stream_session(
+    app: tauri::AppHandle,
+    session_id: String,
+    opts: Option<Value>,
+) -> Result<Value, String> {
+    let mut sess = StreamSession::default();
+    if let Some(o) = opts {
+        sess.language = o
+            .get("language")
+            .and_then(|v| v.as_str())
+            .unwrap_or("auto")
+            .to_string();
+        sess.provider = o
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("openai")
+            .to_string();
+        sess.model = o
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("whisper-1")
+            .to_string();
+    }
+    let t0 = now_ms();
+    // Seed "now" so the first chunk won't immediately fire a partial (we
+    // want MIN_PARTIAL_BYTES + PARTIAL_INTERVAL_MS to accumulate first).
+    sess.last_partial_ms = t0;
+    sess.last_voice_ms = t0;
+    if let Ok(mut map) = app.state::<StreamSessions>().0.lock() {
+        map.insert(session_id, sess);
+    }
+    Ok(json!({ "ok": true }))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn stream_audio_chunk(
+    app: tauri::AppHandle,
+    window: Window,
+    audio_base64: String,
+    session_id: String,
+    meta: Option<Value>,
+) -> Result<Value, String> {
+    use tauri::Emitter;
+    use base64::Engine;
+    let _ = window;
+
+    let is_final = meta
+        .as_ref()
+        .and_then(|m| m.get("isFinal"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // ── Step 1: decode + append chunk, capture session snapshot ──────────
+    let now = now_ms();
+    let sessions = app.state::<StreamSessions>();
+    let (partial_ready, silence_ready, final_stop) = {
+        let Ok(mut map) = sessions.0.lock() else {
+            return Ok(json!({ "ok": true }));
+        };
+        let Some(sess) = map.get_mut(&session_id) else {
+            return Ok(json!({ "ok": true }));
+        };
+        if let Some(bytes) = base64::engine::general_purpose::STANDARD
+            .decode(audio_base64.as_bytes())
+            .ok()
+            .filter(|b| !b.is_empty())
+        {
+            sess.chunks.push(bytes);
+        }
+        let total_bytes: usize = sess.chunks.iter().map(|c| c.len()).sum();
+        let interval_gap = now - sess.last_partial_ms;
+        let silence_gap = now - sess.last_voice_ms;
+        let pr = !sess.in_flight
+            && !sess.final_pending
+            && total_bytes >= MIN_PARTIAL_BYTES
+            && interval_gap >= PARTIAL_INTERVAL_MS;
+        let sr = !sess.in_flight
+            && !sess.final_pending
+            && total_bytes >= MIN_PARTIAL_BYTES
+            && silence_gap >= SILENCE_TRIGGER_MS;
+        if pr {
+            sess.in_flight = true;
+            sess.last_partial_ms = now;
+        }
+        if sr {
+            sess.final_pending = true;
+            sess.in_flight = true;
+        }
+        (pr, sr, is_final)
+    };
+
+    // ── Step 2a: Tier 1 — kick off a fast partial pass ────────────────────
+    if partial_ready && !silence_ready && !final_stop {
+        let app = app.clone();
+        let sid = session_id.clone();
+        let (buf, settings_snapshot, pref_lang) = {
+            let sessions_inner = app.state::<StreamSessions>();
+            let Ok(map) = sessions_inner.0.lock() else {
+                let ss = app.state::<StreamSessions>();
+                if let Ok(mut m) = ss.0.lock() {
+                    if let Some(s) = m.get_mut(&sid) {
+                        s.in_flight = false;
+                    }
+                }
+                return Ok(json!({ "ok": true }));
+            };
+            let Some(sess) = map.get(&sid) else {
+                return Ok(json!({ "ok": true }));
+            };
+            let buf = concat_chunks(&sess.chunks);
+            let lang = sess.language.clone();
+            let store = match app.store(SETTINGS_STORE).map_err(|e| e.to_string()) {
+                Ok(st) => st,
+                Err(_) => {
+                    let ss = app.state::<StreamSessions>();
+                    if let Ok(mut m) = ss.0.lock() {
+                        if let Some(s) = m.get_mut(&sid) {
+                            s.in_flight = false;
+                        }
+                    }
+                    return Ok(json!({ "ok": true }));
+                }
+            };
+            let snap = store.get(SETTINGS_KEY).unwrap_or_else(default_settings);
+            (buf, snap, lang)
+        };
+
+        tauri::async_runtime::spawn(async move {
+            let text = run_fast_partial(&app, buf, settings_snapshot, pref_lang)
+                .await
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+
+            let emit_partial = {
+                let sessions_inner = app.state::<StreamSessions>();
+                let Ok(mut map) = sessions_inner.0.lock() else {
+                    return;
+                };
+                let Some(sess) = map.get_mut(&sid) else {
+                    return;
+                };
+                sess.in_flight = false;
+                let meaningful = text.chars().count() >= MIN_MEANINGFUL_LEN;
+                if meaningful {
+                    sess.last_voice_ms = now_ms();
+                }
+                let silence_now = now_ms() - sess.last_voice_ms >= SILENCE_TRIGGER_MS
+                    && !meaningful;
+                if silence_now && !sess.final_pending {
+                    sess.final_pending = true;
+                }
+                !text.is_empty()
+            };
+
+            if emit_partial {
+                let _ = app.emit_to(
+                    "voiceengine",
+                    "transcript:partial",
+                    json!({ "sessionId": sid, "text": text }),
+                );
+            }
+        });
+    }
+
+    // ── Step 2b: Tier 2 — silence-triggered accurate final pass ───────────
+    if silence_ready && !final_stop {
+        let app = app.clone();
+        let sid = session_id.clone();
+        let (buf, settings_snapshot, pref_lang) = {
+            let sessions_inner = app.state::<StreamSessions>();
+            let Ok(map) = sessions_inner.0.lock() else {
+                let ss = app.state::<StreamSessions>();
+                if let Ok(mut m) = ss.0.lock() {
+                    if let Some(s) = m.get_mut(&sid) {
+                        s.in_flight = false;
+                        s.final_pending = false;
+                    }
+                }
+                return Ok(json!({ "ok": true }));
+            };
+            let Some(sess) = map.get(&sid) else {
+                return Ok(json!({ "ok": true }));
+            };
+            let buf = concat_chunks(&sess.chunks);
+            let lang = sess.language.clone();
+            if buf.len() < 1000 {
+                drop(map);
+                let ss = app.state::<StreamSessions>();
+                if let Ok(mut m) = ss.0.lock() {
+                    if let Some(s) = m.get_mut(&sid) {
+                        s.in_flight = false;
+                        s.final_pending = false;
+                    }
+                }
+                return Ok(json!({ "ok": true }));
+            }
+            let store = match app.store(SETTINGS_STORE).map_err(|e| e.to_string()) {
+                Ok(st) => st,
+                Err(_) => {
+                    let ss = app.state::<StreamSessions>();
+                    if let Ok(mut m) = ss.0.lock() {
+                        if let Some(s) = m.get_mut(&sid) {
+                            s.in_flight = false;
+                            s.final_pending = false;
+                        }
+                    }
+                    return Ok(json!({ "ok": true }));
+                }
+            };
+            let snap = store.get(SETTINGS_KEY).unwrap_or_else(default_settings);
+            (buf, snap, lang)
+        };
+
+        tauri::async_runtime::spawn(async move {
+            let raw = run_accurate_final(&app, buf, settings_snapshot.clone(), pref_lang)
+                .await
+                .unwrap_or_default();
+            let final_text = apply_dictionary(&raw, &settings_snapshot);
+
+            if !final_text.trim().is_empty() {
+                let _ = app.emit_to(
+                    "voiceengine",
+                    "transcript:final",
+                    json!({ "sessionId": sid, "text": final_text }),
+                );
+            }
+
+            let t = now_ms();
+            let ss = app.state::<StreamSessions>();
+            let lock_res = ss.0.lock();
+            if let Ok(mut map) = lock_res {
+                if let Some(sess) = map.get_mut(&sid) {
+                    sess.chunks.clear();
+                    sess.last_partial_ms = t;
+                    sess.last_voice_ms = t;
+                    sess.in_flight = false;
+                    sess.final_pending = false;
+                }
+            }
+        });
+    }
+
+    // ── Step 2c: Tier 2 — stop-triggered accurate final pass (is_final) ───
+    if final_stop {
+        let store = app
+            .store(SETTINGS_STORE)
+            .map_err(|e| e.to_string())?;
+        let s = store.get(SETTINGS_KEY).unwrap_or_else(default_settings);
+        let sessions = app.state::<StreamSessions>();
+
+        let maybe_buf = if let Ok(mut map) = sessions.0.lock() {
+            map.remove(&session_id).map(|sess| {
+                let pref_lang = sess.language.clone();
+                (concat_chunks(&sess.chunks), pref_lang)
+            })
+        } else {
+            None
+        };
+
+        if let Some((buf, pref_lang)) = maybe_buf {
+            if buf.len() > 1000 {
+                let sid = session_id.clone();
+                let app = app.clone();
+                let snap = s.clone();
+                tauri::async_runtime::spawn(async move {
+                    let raw = run_accurate_final(&app, buf, snap.clone(), pref_lang)
+                        .await
+                        .unwrap_or_default();
+                    let final_text = apply_dictionary(&raw, &snap);
+                    if !final_text.trim().is_empty() {
+                        let _ = app.emit_to(
+                            "voiceengine",
+                            "transcript:final",
+                            json!({ "sessionId": sid, "text": final_text }),
+                        );
+                    }
+                });
+            }
+        }
+    }
+
+    Ok(json!({ "ok": true }))
+}
+
+#[tauri::command]
+pub fn end_stream_session(app: tauri::AppHandle, session_id: String) -> Result<Value, String> {
+    if let Ok(mut map) = app.state::<StreamSessions>().0.lock() {
+        map.remove(&session_id);
+    }
+    Ok(json!({ "ok": true }))
+}
+
+/// Focus or open the VoiceEngine live-transcript window. Exposed as a
+/// dedicated command so Settings / tray / context-menu entries can summon it.
+pub fn focus_or_open_voiceengine(app: &tauri::AppHandle) -> Result<(), String> {
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+    if let Some(w) = app.get_webview_window("voiceengine") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(app, "voiceengine", WebviewUrl::App("voiceEngine.html".into()))
+        .title("BizVoice — Live Transcript")
+        .inner_size(900.0, 680.0)
+        .min_inner_size(620.0, 480.0)
+        .resizable(true)
+        .center()
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn open_voice_engine(app: tauri::AppHandle) -> Result<(), String> {
+    focus_or_open_voiceengine(&app)
 }

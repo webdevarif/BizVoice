@@ -110,6 +110,17 @@ const api: Window['api'] = {
   updateLater: () => invoke('update_later'),
   onUpdateProgress: (cb) => sub('update:progress', cb),
   onUpdateDownloaded: (cb) => sub('update:downloaded', cb),
+
+  // ── Live streaming (VoiceEngine) ──
+  startStreamSession: (sessionId, opts) => invoke('start_stream_session', { sessionId, opts }),
+  streamAudioChunk: (audioBase64, sessionId, meta) =>
+    invoke('stream_audio_chunk', { audioBase64, sessionId, meta }),
+  endStreamSession: (sessionId) => invoke('end_stream_session', { sessionId }),
+  onTranscriptPartial: (cb) =>
+    sub<{ sessionId: string; text: string; isFinal?: boolean }>('transcript:partial', cb),
+  onTranscriptFinal: (cb) =>
+    sub<{ sessionId: string; text: string }>('transcript:final', cb),
+  openVoiceEngine: () => invoke('open_voice_engine'),
 };
 
 /** Install `window.api` when running under Tauri. No-op under Electron. */
@@ -174,6 +185,21 @@ declare global {
       updateLater: () => Promise<void>;
       onUpdateProgress: (cb: (data: { percent: number; transferred: number; total: number }) => void) => () => void;
       onUpdateDownloaded: (cb: () => void) => () => void;
+      startStreamSession: (
+        sessionId: string,
+        opts?: { language?: string; provider?: string; model?: string },
+      ) => Promise<any>;
+      streamAudioChunk: (
+        audioBase64: string,
+        sessionId: string,
+        meta?: { isFinal?: boolean; sampleRate?: number; channels?: number; mimeType?: string },
+      ) => Promise<any>;
+      endStreamSession: (sessionId: string) => Promise<any>;
+      onTranscriptPartial: (
+        cb: (ev: { sessionId: string; text: string; isFinal?: boolean }) => void,
+      ) => () => void;
+      onTranscriptFinal: (cb: (ev: { sessionId: string; text: string }) => void) => () => void;
+      openVoiceEngine: () => Promise<void>;
     };
   }
 }

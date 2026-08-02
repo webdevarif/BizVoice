@@ -75,6 +75,7 @@ export default defineConfig({
         settings: resolve(__dirname, 'settings.html'),
         login: resolve(__dirname, 'login.html'),
         update: resolve(__dirname, 'update.html'),
+        voiceEngine: resolve(__dirname, 'voiceEngine.html'),
       },
     },
   },

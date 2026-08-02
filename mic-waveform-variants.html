@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>BizVoice — Waveform Variants</title>
+<style>
+  :root {
+    --bg:#0a0e16; --card:#131a28; --card-hi:#172033; --border:#232c40; --border-hi:#33405b;
+    --text:#e7eef7; --muted:#8593a8; --blue:#3a84ef; --blue-lt:#6aa5ff; --gold:#f7b731; --gold-lt:#ffce5a; --red:#f87171; --green:#4ade80;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html,body { height:100%; }
+  body {
+    background:
+      radial-gradient(1200px 600px at 15% -10%, #16233b 0%, transparent 55%),
+      radial-gradient(1000px 500px at 100% 0%, #1a1330 0%, transparent 50%),
+      var(--bg);
+    color:var(--text);
+    font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    min-height:100%; padding:40px 24px 80px; -webkit-font-smoothing:antialiased;
+  }
+  .wrap { max-width:1040px; margin:0 auto; }
+  header { text-align:center; margin-bottom:8px; }
+  .logo-row { display:flex; align-items:center; justify-content:center; gap:12px; margin-bottom:14px; }
+  .logo-row svg { width:34px; height:34px; filter:drop-shadow(0 2px 6px rgba(58,132,239,.4)); }
+  h1 { font-size:26px; font-weight:700; letter-spacing:-.02em; }
+  h1 .accent { background:linear-gradient(90deg, var(--blue-lt), var(--gold-lt)); -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent; }
+  .sub { color:var(--muted); font-size:14px; margin-top:8px; line-height:1.55; }
+  .hint {
+    margin:22px auto 34px; max-width:660px;
+    background:linear-gradient(180deg, var(--card-hi), var(--card));
+    border:1px solid var(--border); border-radius:14px; padding:14px 18px;
+    font-size:13.5px; color:var(--muted); display:flex; align-items:center; gap:12px; text-align:left;
+  }
+  .hint b { color:var(--text); font-weight:600; }
+  .hint .dot { width:9px; height:9px; border-radius:50%; background:var(--muted); flex:none; box-shadow:0 0 0 4px rgba(133,147,168,.12); }
+  .hint.live .dot { background:var(--green); box-shadow:0 0 0 4px rgba(74,222,128,.15); animation:blink 1.4s infinite; }
+  .hint.denied .dot { background:var(--red); box-shadow:0 0 0 4px rgba(248,113,113,.15); }
+  @keyframes blink { 50% { opacity:.35; } }
+
+  .grid { display:grid; grid-template-columns:repeat(2, 1fr); gap:22px; }
+  @media (max-width:720px) { .grid { grid-template-columns:1fr; } }
+  .card {
+    background:linear-gradient(180deg, var(--card-hi), var(--card));
+    border:1px solid var(--border); border-radius:20px; padding:24px 22px 20px;
+    position:relative; overflow:hidden; transition:border-color .25s, box-shadow .25s;
+  }
+  .card::before { content:""; position:absolute; inset:0; border-radius:20px; background:radial-gradient(400px 200px at 50% -30%, rgba(58,132,239,.10), transparent 70%); opacity:0; transition:opacity .3s; pointer-events:none; }
+  .card.active { border-color:var(--border-hi); box-shadow:0 18px 50px -20px rgba(58,132,239,.35); }
+  .card.active::before { opacity:1; }
+  .card-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:4px; }
+  .card-title { font-size:15px; font-weight:650; letter-spacing:-.01em; }
+  .tag { font-size:10.5px; font-weight:600; text-transform:uppercase; letter-spacing:.06em; color:var(--blue-lt); background:rgba(58,132,239,.12); border:1px solid rgba(58,132,239,.25); padding:3px 8px; border-radius:999px; }
+  .card-desc { font-size:12.5px; color:var(--muted); line-height:1.5; min-height:34px; }
+  .stage { cursor:pointer; user-select:none; margin:8px 0 6px; }
+  .wave-box { width:100%; height:132px; border-radius:16px; background:#0a0f1c; border:1px solid var(--border-hi); overflow:hidden; transition:box-shadow .25s; }
+  .card.active .wave-box { box-shadow:inset 0 0 0 1px rgba(58,132,239,.35), 0 0 24px -6px rgba(58,132,239,.45); }
+  canvas { display:block; width:100%; height:100%; }
+  .status { text-align:center; font-size:12px; color:var(--muted); height:18px; letter-spacing:.02em; }
+  .status.on { color:var(--blue-lt); }
+  footer { margin-top:42px; text-align:center; color:var(--muted); font-size:12.5px; line-height:1.7; }
+  footer code { background:#0c1220; border:1px solid var(--border); border-radius:6px; padding:1px 6px; color:var(--blue-lt); font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo-row">
+      <svg viewBox="0 0 1500 1500" xmlns="http://www.w3.org/2000/svg">
+        <path fill="#3a84ef" d="M1500 750C1500 1164.33 1164.33 1500 750 1500c-.68 0-1.7 0-2.38 0C543.17 1499.32 358.05 1416.93 223.1 1283.68h596.41c71.2 0 132.23-12.88 183.09-38.31 50.86-25.77 89.85-60.36 116.63-104.77 27.13-44.08 40.69-93.58 40.69-148.85 0-72.22-23.05-132.91-69.17-182.07-23.73-25.43-52.89-46.45-87.13-63.41 24.07-13.56 45.09-29.49 62.04-47.8 40.01-42.72 59.68-94.94 59.68-156.65 0-48.48-11.87-92.56-35.6-132.23-23.73-40.01-58.32-71.54-103.07-95.28-24.75-12.88-52.56-22.38-83.07-28.48l497.06 91.21C1463.72 486.89 1500 614.04 1500 750z"/>
+        <path fill="#f7b731" d="M920.55 909.02c11.53 20 16.95 42.72 16.95 68.49 0 36.96-12.21 68.49-36.96 93.92-24.75 25.77-59 38.31-102.4 38.31H91.89C33.23 1002.94 0 880.2 0 750c0-20.34.68-40.69 2.38-60.69 4.4-54.25 14.57-106.8 29.83-157.32C125.79 224.12 411.62 0 750 0c235.65 0 445.86 108.5 583.18 278.37H831.04c-2.71 0-5.77 0-8.82 0H413.31v718.47h198.35V844.94h186.48c29.5 0 54.25 5.76 74.59 16.95 20.68 11.53 36.28 27.13 47.81 47.13zM869.35 479.77c-22.72-18.65-52.55-27.81-89.51-27.81H611.66v223.44h168.18c36.96 0 66.79-9.15 89.51-27.8 22.72-18.65 34.25-46.79 34.25-84.77 0-36.62-11.53-64.42-34.25-83.06z"/>
+      </svg>
+      <h1>Waveform — <span class="accent">4 More Variants</span></h1>
+    </div>
+    <p class="sub">You picked the live waveform. Here are four takes on it — all react to your real voice.<br/>Click one, allow the mic, and speak. Tell me the number and I'll wire it into the app.</p>
+  </header>
+
+  <div class="hint" id="hint">
+    <span class="dot"></span>
+    <span id="hintText"><b>Click any waveform</b> and allow microphone access. Then talk — it reacts live to your voice.</span>
+  </div>
+
+  <div class="grid">
+    <div class="card" data-w="bars">
+      <div class="card-head"><span class="card-title">A · Voice-Memo Bars</span><span class="tag">iOS-style</span></div>
+      <p class="card-desc">Rounded bars mirrored around the center line — the classic voice-message look, driven by frequency.</p>
+      <div class="stage" data-stage><div class="wave-box"><canvas data-canvas></canvas></div></div>
+      <div class="status" data-status>Click to talk</div>
+    </div>
+
+    <div class="card" data-w="filled">
+      <div class="card-head"><span class="card-title">B · Filled Glow Scope</span><span class="tag">Oscilloscope</span></div>
+      <p class="card-desc">The raw waveform line with a glowing gradient fill beneath it. Smooth, vivid, alive.</p>
+      <div class="stage" data-stage><div class="wave-box"><canvas data-canvas></canvas></div></div>
+      <div class="status" data-status>Click to talk</div>
+    </div>
+
+    <div class="card" data-w="history">
+      <div class="card-head"><span class="card-title">C · Scrolling History</span><span class="tag">Recorder</span></div>
+      <p class="card-desc">Bars scroll right-to-left, painting what you just said — like a live recording being captured.</p>
+      <div class="stage" data-stage><div class="wave-box"><canvas data-canvas></canvas></div></div>
+      <div class="status" data-status>Click to talk</div>
+    </div>
+
+    <div class="card" data-w="ribbon">
+      <div class="card-head"><span class="card-title">D · Mirror Ribbon</span><span class="tag">Premium</span></div>
+      <p class="card-desc">A smooth symmetric ribbon that swells from the center and tapers at the ends. Soft and modern.</p>
+      <div class="stage" data-stage><div class="wave-box"><canvas data-canvas></canvas></div></div>
+      <div class="status" data-status>Click to talk</div>
+    </div>
+  </div>
+
+  <footer>
+    Same real Web-Audio pipeline as the app (<code>AnalyserNode</code> + <code>getUserMedia</code>).<br/>
+    Tell me the letter (A–D) and I'll port it into <code>MicBar.tsx</code> with idle / listening / processing states.
+  </footer>
+</div>
+
+<script>
+(() => {
+  // ── Shared audio ─────────────────────────────────────────────────────────
+  let audioCtx=null, analyser=null, freqData=null, timeData=null, stream=null, rafId=null;
+  const activeWidgets=new Set();
+  const hint=document.getElementById('hint'), hintText=document.getElementById('hintText');
+
+  async function ensureAudio() {
+    if (analyser) return;
+    stream = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:true, autoGainControl:true, channelCount:1 } });
+    audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+    const src = audioCtx.createMediaStreamSource(stream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 1024; analyser.smoothingTimeConstant = 0.8;
+    src.connect(analyser);
+    freqData = new Uint8Array(analyser.frequencyBinCount);
+    timeData = new Uint8Array(analyser.fftSize);
+  }
+  function computeViz() {
+    analyser.getByteFrequencyData(freqData);
+    analyser.getByteTimeDomainData(timeData);
+    let sum=0; for (let i=0;i<timeData.length;i++){ const v=(timeData[i]-128)/128; sum+=v*v; }
+    const level=Math.min(1, Math.sqrt(sum/timeData.length)*3.4);
+    return { level, freq:freqData, time:timeData };
+  }
+  function loop() {
+    if (activeWidgets.size===0){ rafId=null; return; }
+    const viz=computeViz();
+    activeWidgets.forEach(w=>w.frame(viz));
+    rafId=requestAnimationFrame(loop);
+  }
+  function kickLoop(){ if(!rafId) rafId=requestAnimationFrame(loop); }
+  function setHint(mode){
+    hint.className='hint'+(mode==='live'?' live':mode==='denied'?' denied':'');
+    if(mode==='live') hintText.innerHTML='<b>Listening…</b> speak now — the active waveform reacts to your voice. Click again to stop.';
+    else if(mode==='denied') hintText.innerHTML='<b>Microphone blocked.</b> Allow mic access (address-bar icon) and click again.';
+    else hintText.innerHTML='<b>Click any waveform</b> and allow microphone access. Then talk — it reacts live to your voice.';
+  }
+
+  function makeWidget(card, impl) {
+    const stage=card.querySelector('[data-stage]'), status=card.querySelector('[data-status]');
+    let on=false;
+    impl.idle && impl.idle();
+    const api={
+      frame:impl.frame,
+      stop(){ on=false; activeWidgets.delete(api); card.classList.remove('active'); status.textContent='Click to talk'; status.classList.remove('on'); impl.reset&&impl.reset(); if(activeWidgets.size===0) setHint('idle'); }
+    };
+    stage.addEventListener('click', async ()=>{
+      if(on){ api.stop(); return; }
+      try { await ensureAudio(); if(audioCtx.state==='suspended') await audioCtx.resume(); }
+      catch(e){ setHint('denied'); return; }
+      on=true; activeWidgets.add(api); card.classList.add('active');
+      status.textContent='Listening — speak now'; status.classList.add('on');
+      impl.start&&impl.start(); setHint('live'); kickLoop();
+    });
+    return api;
+  }
+
+  // ── canvas helpers ───────────────────────────────────────────────────────
+  function canvasOf(card){
+    const canvas=card.querySelector('[data-canvas]'), ctx=canvas.getContext('2d');
+    const dim={W:0,H:0};
+    function resize(){ const dpr=Math.min(window.devicePixelRatio||1,2); const r=canvas.getBoundingClientRect(); dim.W=r.width; dim.H=r.height; canvas.width=dim.W*dpr; canvas.height=dim.H*dpr; ctx.setTransform(dpr,0,0,dpr,0,0); }
+    window.addEventListener('resize', resize);
+    return { canvas, ctx, dim, resize };
+  }
+  function rr(ctx,x,y,w,h,r){ r=Math.min(r,w/2,Math.abs(h)/2); ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+  function mix(t){ // 0..1 blue->gold
+    const a=[58,132,239], b=[247,183,49]; t=Math.max(0,Math.min(1,t));
+    return `rgb(${Math.round(a[0]+(b[0]-a[0])*t)},${Math.round(a[1]+(b[1]-a[1])*t)},${Math.round(a[2]+(b[2]-a[2])*t)})`;
+  }
+
+  // ── A · Voice-Memo Bars (mirrored freq) ──────────────────────────────────
+  (() => {
+    const card=document.querySelector('[data-w="bars"]'); const {ctx,dim,resize}=canvasOf(card);
+    const N=46, smooth=new Array(N).fill(0.04); let idleRaf=null, ph=0;
+    function draw(vals){
+      const {W,H}=dim, mid=H/2, gap=2, bw=(W-gap*(N-1))/N;
+      ctx.clearRect(0,0,W,H);
+      for(let i=0;i<N;i++){
+        const h=Math.max(3, vals[i]*H*0.94), x=i*(bw+gap);
+        const g=ctx.createLinearGradient(0,mid-h/2,0,mid+h/2);
+        g.addColorStop(0,'#ffce5a'); g.addColorStop(.5,'#6aa5ff'); g.addColorStop(1,'#3a84ef');
+        ctx.fillStyle=g; rr(ctx,x,mid-h/2,bw,h,bw/2); ctx.fill();
+      }
+    }
+    function idle(){ ph+=0.05; const v=new Array(N); for(let i=0;i<N;i++) v[i]=0.05+0.03*Math.abs(Math.sin(ph+i*0.4)); draw(v); idleRaf=requestAnimationFrame(idle); }
+    makeWidget(card,{
+      idle(){ resize(); idle(); },
+      start(){ if(idleRaf){cancelAnimationFrame(idleRaf); idleRaf=null;} },
+      reset(){ smooth.fill(0.04); if(!idleRaf) idle(); },
+      frame({freq}){
+        const span=220, per=Math.floor(span/N);
+        for(let i=0;i<N;i++){ let s=0; for(let j=0;j<per;j++) s+=freq[i*per+j]; const t=Math.min(1,(s/per/255)*2.7); smooth[i]+=(t-smooth[i])*0.4; }
+        draw(smooth);
+      }
+    });
+  })();
+
+  // ── B · Filled Glow Scope ────────────────────────────────────────────────
+  (() => {
+    const card=document.querySelector('[data-w="filled"]'); const {ctx,dim,resize}=canvasOf(card);
+    let idleRaf=null, ph=0;
+    function render(getY){
+      const {W,H}=dim; ctx.clearRect(0,0,W,H);
+      const step=Math.max(1,Math.floor(W/240)); const pts=[];
+      for(let x=0;x<=W;x+=step) pts.push([x,getY(x)]);
+      // fill under the line
+      ctx.beginPath(); ctx.moveTo(0,H);
+      pts.forEach(([x,y],i)=> ctx.lineTo(x,y)); ctx.lineTo(W,H); ctx.closePath();
+      const fg=ctx.createLinearGradient(0,0,0,H);
+      fg.addColorStop(0,'rgba(106,165,255,.45)'); fg.addColorStop(1,'rgba(58,132,239,0)');
+      ctx.fillStyle=fg; ctx.fill();
+      // stroke the line
+      ctx.beginPath(); pts.forEach(([x,y],i)=> i?ctx.lineTo(x,y):ctx.moveTo(x,y));
+      const sg=ctx.createLinearGradient(0,0,W,0); sg.addColorStop(0,'#3a84ef'); sg.addColorStop(.5,'#6aa5ff'); sg.addColorStop(1,'#f7b731');
+      ctx.lineWidth=2.5; ctx.strokeStyle=sg; ctx.lineJoin='round'; ctx.lineCap='round';
+      ctx.shadowColor='rgba(58,132,239,.55)'; ctx.shadowBlur=10; ctx.stroke(); ctx.shadowBlur=0;
+    }
+    function idle(){ ph+=0.03; const {H}=dim; render(x=>H/2+Math.sin(x/32+ph)*5*Math.sin(ph*.5)); idleRaf=requestAnimationFrame(idle); }
+    makeWidget(card,{
+      idle(){ resize(); idle(); },
+      start(){ if(idleRaf){cancelAnimationFrame(idleRaf); idleRaf=null;} },
+      reset(){ if(!idleRaf) idle(); },
+      frame({time}){ const n=time.length,{H}=dim,mid=H/2; render(x=>{ const idx=Math.floor((x/dim.W)*n); return mid+((time[idx]-128)/128)*H*0.42; }); }
+    });
+  })();
+
+  // ── C · Scrolling History ────────────────────────────────────────────────
+  (() => {
+    const card=document.querySelector('[data-w="history"]'); const {ctx,dim,resize}=canvasOf(card);
+    const COLS=84; const hist=new Array(COLS).fill(0); let idleRaf=null, ph=0;
+    function draw(){
+      const {W,H}=dim, mid=H/2, bw=W/COLS;
+      ctx.clearRect(0,0,W,H);
+      for(let i=0;i<COLS;i++){
+        const lv=hist[i], h=Math.max(2, lv*H*0.92), x=i*bw;
+        ctx.fillStyle=mix(lv*1.4);
+        ctx.globalAlpha=0.35+0.65*(i/COLS); // fade older (left) columns
+        rr(ctx,x+bw*0.16, mid-h/2, bw*0.68, h, bw*0.34); ctx.fill();
+      }
+      ctx.globalAlpha=1;
+    }
+    function idle(){ ph+=0.05; hist.push(0.04+0.03*Math.abs(Math.sin(ph))); hist.shift(); draw(); idleRaf=requestAnimationFrame(idle); }
+    makeWidget(card,{
+      idle(){ resize(); idle(); },
+      start(){ if(idleRaf){cancelAnimationFrame(idleRaf); idleRaf=null;} },
+      reset(){ hist.fill(0); if(!idleRaf) idle(); },
+      frame({level}){ hist.push(level); hist.shift(); draw(); }
+    });
+  })();
+
+  // ── D · Mirror Ribbon ────────────────────────────────────────────────────
+  (() => {
+    const card=document.querySelector('[data-w="ribbon"]'); const {ctx,dim,resize}=canvasOf(card);
+    const M=72, env=new Array(M).fill(0.02); let idleRaf=null, ph=0;
+    function draw(){
+      const {W,H}=dim, mid=H/2;
+      ctx.clearRect(0,0,W,H);
+      const xs=i=> (i/(M-1))*W;
+      const amp=i=>{ const taper=Math.sin((i/(M-1))*Math.PI); return (0.02+env[i]*0.44)*taper*H; };
+      // build closed ribbon: top L->R, bottom R->L
+      ctx.beginPath();
+      ctx.moveTo(0,mid);
+      for(let i=0;i<M;i++) ctx.lineTo(xs(i), mid-amp(i));
+      for(let i=M-1;i>=0;i--) ctx.lineTo(xs(i), mid+amp(i));
+      ctx.closePath();
+      const g=ctx.createLinearGradient(0,0,W,0);
+      g.addColorStop(0,'rgba(58,132,239,.85)'); g.addColorStop(.5,'rgba(106,165,255,.9)'); g.addColorStop(1,'rgba(247,183,49,.85)');
+      ctx.fillStyle=g; ctx.shadowColor='rgba(90,140,255,.5)'; ctx.shadowBlur=14; ctx.fill(); ctx.shadowBlur=0;
+      // bright center line
+      ctx.beginPath(); ctx.moveTo(0,mid); ctx.lineTo(W,mid);
+      ctx.strokeStyle='rgba(255,255,255,.25)'; ctx.lineWidth=1; ctx.stroke();
+    }
+    function idle(){ ph+=0.04; for(let i=0;i<M;i++) env[i]=0.03+0.02*Math.sin(ph+i*0.25); draw(); idleRaf=requestAnimationFrame(idle); }
+    makeWidget(card,{
+      idle(){ resize(); idle(); },
+      start(){ if(idleRaf){cancelAnimationFrame(idleRaf); idleRaf=null;} },
+      reset(){ env.fill(0.02); if(!idleRaf) idle(); },
+      frame({freq}){
+        const span=280, per=Math.floor(span/M);
+        for(let i=0;i<M;i++){ let s=0; for(let j=0;j<per;j++) s+=freq[i*per+j]; const t=Math.min(1,(s/per/255)*2.6); env[i]+=(t-env[i])*0.35; }
+        draw();
+      }
+    });
+  })();
+})();
+</script>
+</body>
+</html>

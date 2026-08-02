@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>BizVoice — Mic Widget Concepts</title>
+<style>
+  :root {
+    --bg: #0a0e16;
+    --bg2: #0d1320;
+    --card: #131a28;
+    --card-hi: #172033;
+    --border: #232c40;
+    --border-hi: #33405b;
+    --text: #e7eef7;
+    --muted: #8593a8;
+    --blue: #3a84ef;
+    --blue-lt: #6aa5ff;
+    --gold: #f7b731;
+    --gold-lt: #ffce5a;
+    --red: #f87171;
+    --green: #4ade80;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background:
+      radial-gradient(1200px 600px at 15% -10%, #16233b 0%, transparent 55%),
+      radial-gradient(1000px 500px at 100% 0%, #1a1330 0%, transparent 50%),
+      var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    min-height: 100%;
+    padding: 40px 24px 80px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; }
+
+  header { text-align: center; margin-bottom: 8px; }
+  .logo-row { display: flex; align-items: center; justify-content: center; gap: 12px; margin-bottom: 14px; }
+  .logo-row svg { width: 34px; height: 34px; filter: drop-shadow(0 2px 6px rgba(58,132,239,.4)); }
+  h1 { font-size: 26px; font-weight: 700; letter-spacing: -.02em; }
+  h1 .accent { background: linear-gradient(90deg, var(--blue-lt), var(--gold-lt)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+  .sub { color: var(--muted); font-size: 14px; margin-top: 8px; line-height: 1.55; }
+
+  .hint {
+    margin: 22px auto 34px; max-width: 640px;
+    background: linear-gradient(180deg, var(--card-hi), var(--card));
+    border: 1px solid var(--border); border-radius: 14px;
+    padding: 14px 18px; font-size: 13.5px; color: var(--muted);
+    display: flex; align-items: center; gap: 12px; text-align: left;
+  }
+  .hint b { color: var(--text); font-weight: 600; }
+  .hint .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; box-shadow: 0 0 0 4px rgba(133,147,168,.12); }
+  .hint.live .dot { background: var(--green); box-shadow: 0 0 0 4px rgba(74,222,128,.15); animation: blink 1.4s infinite; }
+  .hint.denied .dot { background: var(--red); box-shadow: 0 0 0 4px rgba(248,113,113,.15); }
+  @keyframes blink { 50% { opacity: .35; } }
+
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 22px; }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+
+  .card {
+    background: linear-gradient(180deg, var(--card-hi), var(--card));
+    border: 1px solid var(--border); border-radius: 20px;
+    padding: 26px 22px 22px; position: relative; overflow: hidden;
+    transition: border-color .25s, transform .25s, box-shadow .25s;
+  }
+  .card::before {
+    content: ""; position: absolute; inset: 0; border-radius: 20px;
+    background: radial-gradient(400px 200px at 50% -30%, rgba(58,132,239,.10), transparent 70%);
+    opacity: 0; transition: opacity .3s; pointer-events: none;
+  }
+  .card.active { border-color: var(--border-hi); box-shadow: 0 18px 50px -20px rgba(58,132,239,.35); }
+  .card.active::before { opacity: 1; }
+
+  .card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+  .card-title { font-size: 15px; font-weight: 650; letter-spacing: -.01em; }
+  .tag { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--blue-lt); background: rgba(58,132,239,.12); border: 1px solid rgba(58,132,239,.25); padding: 3px 8px; border-radius: 999px; }
+  .card-desc { font-size: 12.5px; color: var(--muted); line-height: 1.5; min-height: 34px; }
+
+  .stage {
+    height: 190px; display: flex; align-items: center; justify-content: center;
+    margin: 8px 0 6px; cursor: pointer; user-select: none; position: relative;
+  }
+  .status { text-align: center; font-size: 12px; color: var(--muted); height: 18px; letter-spacing: .02em; }
+  .status.on { color: var(--blue-lt); }
+
+  /* ── 1. Equalizer bars (pill) ─────────────────────────────── */
+  .pill {
+    display: inline-flex; align-items: center; gap: 12px;
+    background: #0c1220; border: 1px solid var(--border-hi);
+    border-radius: 999px; padding: 13px 22px;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+    transition: box-shadow .25s, transform .12s;
+  }
+  .pill:active { transform: scale(.97); }
+  .card.active .pill { box-shadow: 0 0 0 1px rgba(58,132,239,.4), 0 0 26px -4px rgba(58,132,239,.5); }
+  .pill .bglyph { width: 20px; height: 20px; flex: none; }
+  .bars { display: flex; align-items: center; gap: 3px; height: 26px; }
+  .bars i {
+    width: 4px; height: 20%; border-radius: 3px;
+    background: linear-gradient(to top, var(--blue), var(--gold-lt));
+    transition: height .06s ease-out;
+  }
+
+  /* ── 2. Pulse orb ─────────────────────────────────────────── */
+  .orb-wrap { position: relative; width: 130px; height: 130px; display: flex; align-items: center; justify-content: center; }
+  .ring { position: absolute; border-radius: 50%; border: 2px solid var(--blue); opacity: 0; }
+  .orb {
+    position: relative; width: 74px; height: 74px; border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, var(--blue-lt), var(--blue) 60%, #1e5bc4 100%);
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 8px 30px -6px rgba(58,132,239,.6), inset 0 2px 6px rgba(255,255,255,.25);
+    transition: transform .07s ease-out, box-shadow .15s;
+    will-change: transform;
+  }
+  .orb svg { width: 30px; height: 30px; }
+  .orb-wrap.idle .orb { animation: orbBreath 3s ease-in-out infinite; }
+  @keyframes orbBreath { 0%,100% { transform: scale(1); } 50% { transform: scale(1.06); } }
+
+  /* ── 3. Waveform ──────────────────────────────────────────── */
+  .wave-box { width: 100%; height: 130px; border-radius: 16px; background: #0a0f1c; border: 1px solid var(--border-hi); overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  /* ── 4. Aurora blob ───────────────────────────────────────── */
+  .blob-wrap { width: 150px; height: 150px; display: flex; align-items: center; justify-content: center; position: relative; }
+  .blob {
+    width: 96px; height: 96px;
+    border-radius: 42% 58% 55% 45% / 48% 42% 58% 52%;
+    background: linear-gradient(135deg, var(--blue) 0%, #7b5cff 45%, var(--gold) 100%);
+    filter: blur(.4px) saturate(1.2);
+    box-shadow: 0 10px 40px -8px rgba(123,92,255,.55);
+    transition: transform .08s ease-out;
+    animation: blobMorph 7s ease-in-out infinite;
+    will-change: transform, border-radius;
+  }
+  .blob-wrap .halo { position: absolute; width: 96px; height: 96px; border-radius: 50%; background: radial-gradient(circle, rgba(123,92,255,.4), transparent 70%); filter: blur(14px); opacity: .5; transition: transform .1s, opacity .1s; }
+  @keyframes blobMorph {
+    0%,100% { border-radius: 42% 58% 55% 45% / 48% 42% 58% 52%; }
+    33% { border-radius: 58% 42% 45% 55% / 55% 58% 42% 45%; }
+    66% { border-radius: 48% 52% 62% 38% / 42% 55% 45% 58%; }
+  }
+
+  footer { margin-top: 42px; text-align: center; color: var(--muted); font-size: 12.5px; line-height: 1.7; }
+  footer code { background: #0c1220; border: 1px solid var(--border); border-radius: 6px; padding: 1px 6px; color: var(--blue-lt); font-size: 12px; }
+  .pick { margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo-row">
+      <!-- BizVoice logo -->
+      <svg viewBox="0 0 1500 1500" xmlns="http://www.w3.org/2000/svg">
+        <path fill="#3a84ef" d="M1500 750C1500 1164.33 1164.33 1500 750 1500c-.68 0-1.7 0-2.38 0C543.17 1499.32 358.05 1416.93 223.1 1283.68h596.41c71.2 0 132.23-12.88 183.09-38.31 50.86-25.77 89.85-60.36 116.63-104.77 27.13-44.08 40.69-93.58 40.69-148.85 0-72.22-23.05-132.91-69.17-182.07-23.73-25.43-52.89-46.45-87.13-63.41 24.07-13.56 45.09-29.49 62.04-47.8 40.01-42.72 59.68-94.94 59.68-156.65 0-48.48-11.87-92.56-35.6-132.23-23.73-40.01-58.32-71.54-103.07-95.28-24.75-12.88-52.56-22.38-83.07-28.48l497.06 91.21C1463.72 486.89 1500 614.04 1500 750z"/>
+        <path fill="#f7b731" d="M920.55 909.02c11.53 20 16.95 42.72 16.95 68.49 0 36.96-12.21 68.49-36.96 93.92-24.75 25.77-59 38.31-102.4 38.31H91.89C33.23 1002.94 0 880.2 0 750c0-20.34.68-40.69 2.38-60.69 4.4-54.25 14.57-106.8 29.83-157.32C125.79 224.12 411.62 0 750 0c235.65 0 445.86 108.5 583.18 278.37H831.04c-2.71 0-5.77 0-8.82 0H413.31v718.47h198.35V844.94h186.48c29.5 0 54.25 5.76 74.59 16.95 20.68 11.53 36.28 27.13 47.81 47.13zM869.35 479.77c-22.72-18.65-52.55-27.81-89.51-27.81H611.66v223.44h168.18c36.96 0 66.79-9.15 89.51-27.8 22.72-18.65 34.25-46.79 34.25-84.77 0-36.62-11.53-64.42-34.25-83.06z"/>
+      </svg>
+      <h1>BizVoice — <span class="accent">Mic Widget Concepts</span></h1>
+    </div>
+    <p class="sub">Four voice-reactive mic designs. They use your real microphone — click one, allow access, and speak.<br/>Pick the one you like and I'll wire it into the app's floating mic bar.</p>
+  </header>
+
+  <div class="hint" id="hint">
+    <span class="dot"></span>
+    <span id="hintText"><b>Click any widget below</b> and allow microphone access when your browser asks. Then talk — the animation reacts live to your voice.</span>
+  </div>
+
+  <div class="grid">
+    <!-- 1 -->
+    <div class="card" data-w="bars">
+      <div class="card-head"><span class="card-title">1 · Equalizer Pill</span><span class="tag">Closest to now</span></div>
+      <p class="card-desc">The current style, refined. Frequency bars in a compact pill with the brand logo — clean and unobtrusive.</p>
+      <div class="stage" data-stage>
+        <div class="pill">
+          <svg class="bglyph" viewBox="0 0 1500 1500"><path fill="#3a84ef" d="M413 278h410v719H413z"/><path fill="#f7b731" d="M611 452h169c37 0 67 9 89 28 23 19 34 46 34 83s-11 64-34 83c-22 18-52 28-89 28H611V452zm0 393h187c30 0 54 6 75 17 20 12 36 27 47 47 12 20 17 43 17 69 0 37-12 68-37 94-24 25-59 38-102 38H413V278h198v567z"/></svg>
+          <div class="bars" data-bars></div>
+        </div>
+      </div>
+      <div class="status" data-status>Click to talk</div>
+    </div>
+
+    <!-- 2 -->
+    <div class="card" data-w="orb">
+      <div class="card-head"><span class="card-title">2 · Pulse Orb</span><span class="tag">Siri-style</span></div>
+      <p class="card-desc">A glowing round button that swells with your voice and emits ripples on peaks. Bold, tappable, iconic.</p>
+      <div class="stage" data-stage>
+        <div class="orb-wrap idle" data-orbwrap>
+          <div class="orb" data-orb>
+            <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1M12 18v4"/></svg>
+          </div>
+        </div>
+      </div>
+      <div class="status" data-status>Click to talk</div>
+    </div>
+
+    <!-- 3 -->
+    <div class="card" data-w="wave">
+      <div class="card-head"><span class="card-title">3 · Live Waveform</span><span class="tag">Oscilloscope</span></div>
+      <p class="card-desc">A real-time waveform of your voice drawn across a wide strip. Feels responsive and technical.</p>
+      <div class="stage" data-stage>
+        <div class="wave-box"><canvas data-canvas></canvas></div>
+      </div>
+      <div class="status" data-status>Click to talk</div>
+    </div>
+
+    <!-- 4 -->
+    <div class="card" data-w="blob">
+      <div class="card-head"><span class="card-title">4 · Aurora Blob</span><span class="tag">Apple-Intelligence</span></div>
+      <p class="card-desc">A morphing gradient blob that breathes, scales and shifts hue with your voice. Modern and premium.</p>
+      <div class="stage" data-stage>
+        <div class="blob-wrap" data-blobwrap>
+          <div class="halo" data-halo></div>
+          <div class="blob" data-blob></div>
+        </div>
+      </div>
+      <div class="status" data-status>Click to talk</div>
+    </div>
+  </div>
+
+  <footer>
+    All four share one real Web-Audio pipeline (<code>AnalyserNode</code> + <code>getUserMedia</code>) — the same one the app uses.<br/>
+    <span class="pick">Tell me the number you want and I'll port it into <code>MicBar.tsx</code> (idle / listening / processing states included).</span>
+  </footer>
+</div>
+
+<script>
+(() => {
+  // ── Shared audio pipeline ────────────────────────────────────────────────
+  let audioCtx = null, analyser = null, freqData = null, timeData = null, stream = null, rafId = null;
+  const activeWidgets = new Set();
+  const hint = document.getElementById('hint');
+  const hintText = document.getElementById('hintText');
+
+  async function ensureAudio() {
+    if (analyser) return;
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 }
+    });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = audioCtx.createMediaStreamSource(stream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0.82;
+    src.connect(analyser); // NOTE: not connected to destination — no echo
+    freqData = new Uint8Array(analyser.frequencyBinCount); // 512
+    timeData = new Uint8Array(analyser.fftSize);           // 1024
+  }
+
+  function computeViz() {
+    analyser.getByteFrequencyData(freqData);
+    analyser.getByteTimeDomainData(timeData);
+    let sum = 0;
+    for (let i = 0; i < timeData.length; i++) { const v = (timeData[i] - 128) / 128; sum += v * v; }
+    const rms = Math.sqrt(sum / timeData.length);
+    const level = Math.min(1, rms * 3.4); // perceptual gain
+    return { level, freq: freqData, time: timeData };
+  }
+
+  function loop() {
+    if (activeWidgets.size === 0) { rafId = null; return; }
+    const viz = computeViz();
+    activeWidgets.forEach(w => w.frame(viz));
+    rafId = requestAnimationFrame(loop);
+  }
+  function kickLoop() { if (!rafId) rafId = requestAnimationFrame(loop); }
+
+  function setHint(mode) {
+    hint.className = 'hint' + (mode === 'live' ? ' live' : mode === 'denied' ? ' denied' : '');
+    if (mode === 'live') hintText.innerHTML = '<b>Listening…</b> speak now — the active widget reacts to your voice. Click it again to stop.';
+    else if (mode === 'denied') hintText.innerHTML = '<b>Microphone blocked.</b> Allow mic access for this page in your browser (address-bar icon) and click again.';
+    else hintText.innerHTML = '<b>Click any widget below</b> and allow microphone access when your browser asks. Then talk — the animation reacts live to your voice.';
+  }
+
+  // ── Widget factory ───────────────────────────────────────────────────────
+  function makeWidget(card, impl) {
+    const stage = card.querySelector('[data-stage]');
+    const status = card.querySelector('[data-status]');
+    let on = false;
+    impl.idle && impl.idle();
+
+    const api = {
+      frame: impl.frame,
+      stop() {
+        on = false; activeWidgets.delete(api);
+        card.classList.remove('active');
+        status.textContent = 'Click to talk'; status.classList.remove('on');
+        impl.reset && impl.reset();
+        if (activeWidgets.size === 0) setHint('idle');
+      }
+    };
+
+    stage.addEventListener('click', async () => {
+      if (on) { api.stop(); return; }
+      try {
+        await ensureAudio();
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
+      } catch (e) { setHint('denied'); return; }
+      on = true; activeWidgets.add(api);
+      card.classList.add('active');
+      status.textContent = 'Listening — speak now'; status.classList.add('on');
+      impl.start && impl.start();
+      setHint('live');
+      kickLoop();
+    });
+    return api;
+  }
+
+  // ── 1. Equalizer bars ────────────────────────────────────────────────────
+  (() => {
+    const card = document.querySelector('[data-w="bars"]');
+    const host = card.querySelector('[data-bars]');
+    const N = 9;
+    const bars = [];
+    for (let i = 0; i < N; i++) { const b = document.createElement('i'); host.appendChild(b); bars.push(b); }
+    const smooth = new Array(N).fill(0.12);
+    makeWidget(card, {
+      idle() { bars.forEach(b => b.style.height = '18%'); },
+      reset() { smooth.fill(0.12); bars.forEach(b => b.style.height = '18%'); },
+      frame({ freq }) {
+        // Voice energy lives in the lower bins — spread first ~160 bins over N bars.
+        const span = 160, per = Math.floor(span / N);
+        for (let i = 0; i < N; i++) {
+          let s = 0; for (let j = 0; j < per; j++) s += freq[i * per + j];
+          const t = Math.min(1, (s / per / 255) * 2.6);
+          smooth[i] += (t - smooth[i]) * 0.45;
+          // center bars taller (nicer shape)
+          const shape = 0.7 + 0.3 * Math.sin((i / (N - 1)) * Math.PI);
+          bars[i].style.height = Math.max(14, smooth[i] * shape * 100) + '%';
+        }
+      }
+    });
+  })();
+
+  // ── 2. Pulse orb ─────────────────────────────────────────────────────────
+  (() => {
+    const card = document.querySelector('[data-w="orb"]');
+    const wrap = card.querySelector('[data-orbwrap]');
+    const orb = card.querySelector('[data-orb]');
+    let lastRing = 0;
+    function ripple(strength) {
+      const r = document.createElement('div');
+      r.className = 'ring';
+      const size = 74;
+      r.style.width = r.style.height = size + 'px';
+      wrap.appendChild(r);
+      r.animate([
+        { transform: 'scale(1)', opacity: 0.5 * strength + 0.15, borderWidth: '2px' },
+        { transform: 'scale(1.9)', opacity: 0, borderWidth: '0.5px' }
+      ], { duration: 900, easing: 'cubic-bezier(.2,.6,.3,1)' }).onfinish = () => r.remove();
+    }
+    makeWidget(card, {
+      start() { wrap.classList.remove('idle'); },
+      reset() { wrap.classList.add('idle'); orb.style.transform = 'scale(1)'; orb.style.boxShadow = ''; },
+      frame({ level }) {
+        const s = 1 + level * 0.55;
+        orb.style.transform = 'scale(' + s.toFixed(3) + ')';
+        orb.style.boxShadow = `0 8px ${20 + level * 40}px -4px rgba(58,132,239,${0.5 + level * 0.4}), inset 0 2px 6px rgba(255,255,255,.25)`;
+        const now = performance.now();
+        if (level > 0.28 && now - lastRing > 180) { lastRing = now; ripple(level); }
+      }
+    });
+  })();
+
+  // ── 3. Waveform ──────────────────────────────────────────────────────────
+  (() => {
+    const card = document.querySelector('[data-w="wave"]');
+    const canvas = card.querySelector('[data-canvas]');
+    const ctx = canvas.getContext('2d');
+    let W = 0, H = 0, idleRaf = null, phase = 0;
+    function resize() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const r = canvas.getBoundingClientRect();
+      W = r.width; H = r.height;
+      canvas.width = W * dpr; canvas.height = H * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    function stroke(getY) {
+      ctx.clearRect(0, 0, W, H);
+      const grad = ctx.createLinearGradient(0, 0, W, 0);
+      grad.addColorStop(0, '#3a84ef'); grad.addColorStop(.5, '#6aa5ff'); grad.addColorStop(1, '#f7b731');
+      ctx.lineWidth = 2.5; ctx.strokeStyle = grad; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+      ctx.shadowColor = 'rgba(58,132,239,.5)'; ctx.shadowBlur = 8;
+      ctx.beginPath();
+      const step = Math.max(1, Math.floor(W / 220));
+      for (let x = 0; x <= W; x += step) { const y = getY(x); x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y); }
+      ctx.stroke();
+    }
+    function idleDraw() {
+      phase += 0.03;
+      stroke(x => H / 2 + Math.sin(x / 34 + phase) * 5 * Math.sin(phase * 0.5));
+      idleRaf = requestAnimationFrame(idleDraw);
+    }
+    makeWidget(card, {
+      idle() { resize(); idleDraw(); },
+      start() { if (idleRaf) { cancelAnimationFrame(idleRaf); idleRaf = null; } },
+      reset() { if (!idleRaf) idleDraw(); },
+      frame({ time }) {
+        const n = time.length, mid = H / 2;
+        stroke(x => {
+          const idx = Math.floor((x / W) * n);
+          const v = (time[idx] - 128) / 128; // -1..1
+          return mid + v * (H * 0.42);
+        });
+      }
+    });
+    window.addEventListener('resize', resize);
+  })();
+
+  // ── 4. Aurora blob ───────────────────────────────────────────────────────
+  (() => {
+    const card = document.querySelector('[data-w="blob"]');
+    const blob = card.querySelector('[data-blob]');
+    const halo = card.querySelector('[data-halo]');
+    let hue = 0;
+    makeWidget(card, {
+      reset() { blob.style.transform = ''; blob.style.filter = ''; halo.style.transform = ''; halo.style.opacity = .5; },
+      frame({ level }) {
+        const s = 1 + level * 0.42;
+        hue = (hue + level * 6) % 40;
+        blob.style.transform = `scale(${s.toFixed(3)}) rotate(${level * 12}deg)`;
+        blob.style.filter = `blur(.4px) saturate(${1.2 + level}) hue-rotate(${hue - 20}deg) brightness(${1 + level * 0.25})`;
+        halo.style.transform = `scale(${(1 + level * 0.9).toFixed(3)})`;
+        halo.style.opacity = (0.45 + level * 0.5).toFixed(2);
+      }
+    });
+  })();
+})();
+</script>
+</body>
+</html>
