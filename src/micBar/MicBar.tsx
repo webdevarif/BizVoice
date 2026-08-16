@@ -162,8 +162,13 @@ export function MicBar() {
 
   async function refreshSettings() {
     const s = await window.api.getSettings();
-    // Ready if: local mode (no key needed), or the active cloud provider has a key
-    const ready = !!s.useLocalWhisper || (s.sttProvider === 'groq' ? !!s.hasGroqKey : !!s.hasKey);
+    // Ready if: local mode (no key needed), premium Scribe with at least one of
+    // the user's own ElevenLabs keys (which overrides the provider entirely and
+    // needs no OpenAI/Groq key), or the active cloud provider has a key.
+    const ready =
+      !!s.useLocalWhisper ||
+      (!!s.useScribe && !!s.hasElevenlabsKeys) ||
+      (s.sttProvider === 'groq' ? !!s.hasGroqKey : !!s.hasKey);
     setHasKey(ready);
     hasKeyRef.current = ready;
     if (s.theme) setTheme(s.theme);
@@ -187,6 +192,10 @@ export function MicBar() {
       setTheme(theme as any);
       setWidgetStyle(widgetStyle as any);
     });
+    // This window is non-focusable, so the focus listener below effectively
+    // never fires — the push from set_settings is what actually keeps the
+    // "No API Key" state current after the user saves a key.
+    const removeSettings = window.api.onSettingsChange?.(() => { refreshSettings(); });
     refreshSettings();
     window.addEventListener('focus', refreshSettings);
     return () => {
@@ -194,6 +203,7 @@ export function MicBar() {
       removePttStart();
       removePttStop();
       removeAppearance();
+      removeSettings?.();
       window.removeEventListener('focus', refreshSettings);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

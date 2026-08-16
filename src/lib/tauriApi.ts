@@ -95,6 +95,7 @@ const api: Window['api'] = {
 
   // ── Appearance ──
   onAppearanceChange: (cb) => sub('appearance:changed', cb),
+  onSettingsChange: (cb) => sub('settings:changed', cb),
 
   // ── BizGrowHub auth + license ──
   startBrowserLogin: () => invoke('start_browser_login'),
@@ -184,6 +185,8 @@ declare global {
       whisperDeleteModel: (name: string) => Promise<boolean>;
       onWhisperDownloadProgress: (cb: (data: { model: string; pct: number }) => void) => () => void;
       onAppearanceChange: (cb: (data: { theme: string; widgetStyle: string }) => void) => () => void;
+      /** Fired after any settings write, so non-focusable windows can re-read. */
+      onSettingsChange: (cb: () => void) => () => void;
       startBrowserLogin: () => Promise<{ ok: boolean; error?: string }>;
       cancelBrowserLogin: () => Promise<{ ok: boolean }>;
       logout: () => Promise<{ ok: boolean }>;

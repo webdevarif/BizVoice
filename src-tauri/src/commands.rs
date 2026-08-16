@@ -107,11 +107,17 @@ fn add_key_flags(s: &mut Value) {
             flag("customKeyEncrypted"),
         )
     };
+    // Whether premium STT can actually run. Counted from the decodable keys
+    // rather than the row count, so a row the user added but never saved
+    // doesn't make the mic bar think it's ready.
+    let has_eleven = !decode_elevenlabs_keys(s).is_empty();
+
     if let Some(o) = s.as_object_mut() {
         o.insert("hasKey".into(), Value::Bool(has_key));
         o.insert("hasGroqKey".into(), Value::Bool(has_groq));
         o.insert("hasOpenrouterKey".into(), Value::Bool(has_or));
         o.insert("hasCustomKey".into(), Value::Bool(has_custom));
+        o.insert("hasElevenlabsKeys".into(), Value::Bool(has_eleven));
     }
 }
 
@@ -539,6 +545,14 @@ pub fn set_settings(app: tauri::AppHandle, mut patch: Value) -> Result<Value, St
             "appearance:changed",
             json!({ "theme": theme, "widgetStyle": widget_style }),
         );
+    }
+    // Any settings write can change whether the mic bar is able to record (a
+    // key added or removed, premium toggled). It re-reads settings on window
+    // focus, but it is deliberately non-focusable, so that never fires — without
+    // this push it would keep showing "No API Key" until the app restarts.
+    {
+        use tauri::Emitter;
+        let _ = app.emit_to("micbar", "settings:changed", ());
     }
     Ok(json!({ "ok": true }))
 }
