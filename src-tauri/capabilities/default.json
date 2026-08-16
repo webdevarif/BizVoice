@@ -1,7 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Core window/store APIs for all app windows.",
+  "description": "Core window APIs for all app windows.",
   "windows": ["login", "settings", "update", "micbar"],
-  "permissions": ["core:default", "store:default", "updater:default"]
+  "comment": "store:default is deliberately NOT granted: the WebView reaches settings only through the get_settings/set_settings commands, which mask ElevenLabs keys. Direct store access would let the WebView read the raw ciphertext and defeat that masking.",
+  "permissions": ["core:default", "updater:default"]
 }

@@ -339,13 +339,22 @@ export function Settings() {
   // transient `draft` while the user is typing a new key. Because the settings
   // store replaces arrays wholesale, every mutation persists the FULL list.
 
-  function persistElKeys(next: ElKey[], msg: string) {
+  /**
+   * Persist the whole list (the store replaces arrays wholesale).
+   *
+   * `commitId` is the ONLY row allowed to send a plaintext `key`. Every other
+   * row sends just its id, which tells Rust to keep the ciphertext it already
+   * has. Without that restriction, saving or removing one row would also commit
+   * whatever half-typed text another row happened to be holding, silently
+   * overwriting a working key with an unusable fragment.
+   */
+  function persistElKeys(next: ElKey[], msg: string, commitId?: string) {
     setElKeys(next);
-    // Strip UI-only fields, and send `key` only for rows holding a fresh draft —
-    // omitting it tells Rust to keep whatever ciphertext it already has.
-    const payload = next.map(({ id, draft }) => (
-      draft && !draft.startsWith('•') ? { id, key: draft.trim() } : { id }
-    ));
+    const payload = next.map(({ id, draft }) =>
+      id === commitId && draft && !draft.startsWith('•')
+        ? { id, key: draft.trim() }
+        : { id },
+    );
     save({ elevenlabsKeys: payload }, msg);
   }
 
@@ -362,11 +371,26 @@ export function Settings() {
   async function saveElKey(id: string, raw: string) {
     const t = raw.trim();
     if (!t || t.startsWith('•')) { flash('err', 'Please enter a key'); return; }
-    const next = elKeys.map((r) => (r.id === id ? { ...r, draft: t, status: undefined, error: undefined } : r));
-    persistElKeys(next, 'ElevenLabs key saved');
-    // Reload so the row picks up the masked hint Rust generated and drops the draft.
+    const next = elKeys.map((r) =>
+      r.id === id ? { ...r, draft: t, status: undefined, error: undefined, note: undefined } : r,
+    );
+    persistElKeys(next, 'ElevenLabs key saved', id);
+
+    // Reload so the row picks up the masked hint Rust generated and drops its
+    // draft — but carry over each row's probe result, which the reload doesn't
+    // include and which no effect would otherwise restore (the id set is
+    // unchanged, so the auto-probe below won't re-fire).
     const s: any = await window.api.getSettings();
-    setElKeys(readElKeys(s));
+    setElKeys((prev) =>
+      readElKeys(s).map((row) => {
+        const before = prev.find((p) => p.id === row.id);
+        // The saved row's old reading belongs to the key it just replaced.
+        if (!before || row.id === id) return row;
+        const { id: _id, hint: _hint, draft: _draft, ...probe } = before;
+        return { ...row, ...probe };
+      }),
+    );
+    void testElKey(id);
   }
 
   function removeElKey(id: string) {
@@ -381,6 +405,7 @@ export function Settings() {
         testing: false,
         status: res.ok ? 'ok' : 'fail',
         error: res.ok ? undefined : res.error,
+        note: res.note,
         tier: res.tier,
         charsUsed: res.charsUsed ?? undefined,
         charsLimit: res.charsLimit ?? undefined,
@@ -389,6 +414,18 @@ export function Settings() {
       updateElKey(id, { testing: false, status: 'fail', error: err?.message ?? 'Test failed' });
     }
   }
+
+  // Probe every saved key once its row exists, so each shows a credit ring
+  // without the user clicking Test on all of them. Keyed on the id list, not
+  // elKeys, so the state each probe writes back doesn't re-trigger this.
+  const elIdsKey = elKeys.map((r) => r.id).join(',');
+  useEffect(() => {
+    if (!useScribe) return;
+    for (const r of elKeys) {
+      if (r.hint && !r.status && !r.testing) void testElKey(r.id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [elIdsKey, useScribe]);
 
   async function saveApiKey() {
     const t = apiKey.trim();
@@ -1435,6 +1472,8 @@ interface ElKey {
   testing?: boolean;
   status?: 'ok' | 'fail';
   error?: string;
+  /** Set when the key works but its scope hides the balance. */
+  note?: string;
   tier?: string;
   charsUsed?: number;
   charsLimit?: number;
@@ -1450,6 +1489,57 @@ function readElKeys(s: any): ElKey[] {
 }
 
 const nfmt = new Intl.NumberFormat('en-US');
+
+/** Donut showing how much of an account's quota is still available. Grey and
+ *  dashless until a probe has run, so "not checked yet" never looks like zero. */
+function CreditRing({ used, limit, busy }: { used?: number; limit?: number; busy?: boolean }) {
+  const R = 13;
+  const C = 2 * Math.PI * R;
+  const known = used != null && limit != null && limit > 0;
+  const remaining = known ? Math.max(limit - used, 0) : 0;
+  const frac = known ? Math.min(remaining / limit, 1) : 0;
+  const pct = Math.round(frac * 100);
+  // Red once nearly spent, so a key about to fail over is visible at a glance.
+  const color = !known ? '#ffffff30' : pct <= 15 ? '#f87171' : pct <= 40 ? '#fbbf24' : '#34d399';
+
+  return (
+    <div
+      className="relative shrink-0 w-9 h-9"
+      title={
+        known
+          ? `${nfmt.format(remaining)} of ${nfmt.format(limit!)} credits left — ${100 - pct}% used`
+          : 'Credits not checked yet'
+      }
+    >
+      {/* The spinner animates the whole SVG, not the arc: a CSS transform on an
+          inner <circle> would override its rotate() attribute rather than
+          compose with it, and would spin about the wrong origin. */}
+      <svg width="36" height="36" viewBox="0 0 36 36" className={busy ? 'animate-spin' : undefined}>
+        {!busy && <circle cx="18" cy="18" r={R} fill="none" stroke="#ffffff14" strokeWidth="3" />}
+        {busy ? (
+          <circle
+            cx="18" cy="18" r={R} fill="none" stroke="#ffffff55" strokeWidth="3"
+            strokeDasharray={`${C * 0.25} ${C}`} strokeLinecap="round"
+          />
+        ) : known ? (
+          <circle
+            cx="18" cy="18" r={R} fill="none" stroke={color} strokeWidth="3"
+            strokeDasharray={C} strokeDashoffset={C * (1 - frac)} strokeLinecap="round"
+            transform="rotate(-90 18 18)"
+          />
+        ) : null}
+      </svg>
+      {!busy && (
+        <div
+          className="absolute inset-0 flex items-center justify-center text-[9px] font-semibold tabular-nums"
+          style={{ color: known ? color : '#ffffff40' }}
+        >
+          {known ? `${pct}%` : '–'}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function ElKeyRow({ row, index, onChange, onSave, onRemove, onTest }: {
   row: ElKey;
@@ -1483,9 +1573,18 @@ function ElKeyRow({ row, index, onChange, onSave, onRemove, onTest }: {
               onClick={() => onSave(row.draft ?? '')}
               className="shrink-0 px-2.5 py-1.5 rounded bg-blue-600 hover:bg-blue-500 text-white text-[11px] font-semibold"
             >Save</button>
+            {/* Only offered once a key exists — there is nothing to fall back to
+                on a brand-new row, which stays in edit mode until saved. */}
+            {row.hint && (
+              <button
+                onClick={() => onChange({ draft: undefined })}
+                className="shrink-0 px-2.5 py-1.5 rounded bg-white/5 hover:bg-white/10 text-white/60 text-[11px]"
+              >Cancel</button>
+            )}
           </>
         ) : (
           <>
+            <CreditRing used={row.charsUsed} limit={row.charsLimit} busy={row.testing} />
             <span className="flex-1 min-w-0 truncate text-[12px] font-mono text-white/50">{row.hint}</span>
             <button
               onClick={() => onChange({ draft: '' })}
@@ -1506,10 +1605,16 @@ function ElKeyRow({ row, index, onChange, onSave, onRemove, onTest }: {
       </div>
 
       {row.status === 'ok' && (
-        <div className="text-[11px] text-green-400 mt-1.5 ml-6">
-          ✓ Working{row.tier ? ` — ${row.tier}` : ''}
-          {remaining !== null ? ` · ${nfmt.format(remaining)} credits left` : ''}
-        </div>
+        row.note ? (
+          <div className="text-[11px] text-amber-400/80 mt-1.5 ml-6">✓ {row.note}</div>
+        ) : (
+          <div className="text-[11px] text-white/45 mt-1.5 ml-6">
+            {row.tier ? `${row.tier} · ` : ''}
+            {remaining !== null && row.charsLimit != null
+              ? `${nfmt.format(remaining)} of ${nfmt.format(row.charsLimit)} credits left`
+              : 'Working'}
+          </div>
+        )
       )}
       {row.status === 'fail' && (
         <div className="text-[11px] text-red-400 mt-1.5 ml-6">✕ {row.error ?? 'Test failed'}</div>

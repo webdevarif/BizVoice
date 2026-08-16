@@ -152,6 +152,9 @@ declare global {
       setSettings: (patch: any) => Promise<any>;
       testElevenLabsKey: (id: string) => Promise<{
         ok: boolean;
+        /** Key authenticated but its scope hides the balance. */
+        restricted?: boolean;
+        note?: string;
         tier?: string;
         charsUsed?: number | null;
         charsLimit?: number | null;

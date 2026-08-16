@@ -278,9 +278,26 @@ pub async fn probe_elevenlabs_key(key: &str) -> Value {
     let body = resp.text().await.unwrap_or_default();
 
     if !status.is_success() {
-        let msg = if is_quota_error(&body) {
-            "Out of credits".to_string()
-        } else if status.as_u16() == 401 {
+        let lower = body.to_lowercase();
+
+        if is_quota_error(&body) {
+            return serde_json::json!({ "ok": false, "error": "Out of credits" });
+        }
+
+        // ElevenLabs keys are scope-restricted, and reading the balance needs the
+        // `user_read` scope that a transcription-only key won't have. Crucially
+        // this response PROVES the key authenticated — a wrong key never reaches
+        // the permission check — so the key is fine, the balance just isn't
+        // visible. Reporting it as rejected would be plainly wrong.
+        if lower.contains("missing_permissions") {
+            return serde_json::json!({
+                "ok": true,
+                "restricted": true,
+                "note": "Valid key — credits hidden. Enable the \"User: Read\" permission for this key in the ElevenLabs dashboard to show the balance.",
+            });
+        }
+
+        let msg = if status.as_u16() == 401 {
             "Key rejected — check it was copied correctly".to_string()
         } else {
             let snippet: String = body.chars().take(160).collect();
@@ -315,6 +332,10 @@ async fn scribe_attempt(
         .map_err(|e| (e.to_string(), false))?;
     let mut form = reqwest::multipart::Form::new()
         .text("model_id", "scribe_v1")
+        // Scribe otherwise annotates non-speech sounds inline, so a cough or a
+        // laugh gets typed into the user's document as "(laughs)". Dictation
+        // wants the words only.
+        .text("tag_audio_events", "false")
         .part("file", part);
     if let Some(code) = lang {
         form = form.text("language_code", code);
@@ -335,10 +356,18 @@ async fn scribe_attempt(
     let body = resp.text().await.unwrap_or_default();
 
     if !status.is_success() {
-        let snippet: String = body.chars().take(200).collect();
         let retryable =
             is_quota_error(&body) || status.as_u16() == 401 || status.as_u16() == 429 || status.is_server_error();
-        return Err((format!("Scribe failed ({status}): {snippet}"), retryable));
+
+        // A key created without the speech_to_text scope authenticates fine and
+        // then fails here, which reads as a baffling 401 unless we say so.
+        let msg = if body.to_lowercase().contains("missing_permissions") {
+            "key lacks the \"Speech to Text\" permission".to_string()
+        } else {
+            let snippet: String = body.chars().take(200).collect();
+            format!("Scribe failed ({status}): {snippet}")
+        };
+        return Err((msg, retryable));
     }
 
     let data: Value = serde_json::from_str(&body).map_err(|e| (e.to_string(), false))?;
