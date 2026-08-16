@@ -25,7 +25,10 @@ pub struct PipelineOpts {
     pub skip_gpt: bool,
     pub style_prompt: String,
     pub vocabulary: String,      // custom terms/names → Whisper STT prompt bias
-    pub use_scribe: bool,        // premium ElevenLabs Scribe STT via the proxy
+    pub use_scribe: bool,        // premium ElevenLabs Scribe STT (user's own keys)
+    /// The user's ElevenLabs keys as (label, key), tried in order. More than one
+    /// lets dictation survive an account running out of credits mid-session.
+    pub elevenlabs_keys: Vec<(String, String)>,
     pub use_better_bangla: bool, // route Bangla through BizGrowHub's tuned ASR
     pub auth_token: String,      // BizGrowHub JWT (auth for the Bangla proxy)
     pub api_base: String,        // BizGrowHub base URL (e.g. https://bizgrowhub.shop)
@@ -72,11 +75,11 @@ pub async fn run_pipeline(opts: PipelineOpts) -> Result<String, String> {
     let client = reqwest::Client::new();
     let iso = to_iso(&opts.input_lang);
 
-    // ── Premium STT — ElevenLabs Scribe via the BizGrowHub proxy ───────────
+    // ── Premium STT — ElevenLabs Scribe, direct with the user's own keys ────
     // Best-in-class accuracy. Takes priority over the other STT paths when on
-    // and the user is signed in. No fallback: the user chose premium, so we
-    // surface failures instead of silently dropping to a weaker model.
-    if opts.use_scribe && !opts.auth_token.is_empty() {
+    // and at least one key is saved. No fallback to Whisper: the user chose
+    // premium, so we surface failures instead of silently returning worse text.
+    if opts.use_scribe && !opts.elevenlabs_keys.is_empty() {
         let raw = scribe_stt(&client, &opts, &bytes).await?;
         let raw = raw.trim().to_string();
         #[cfg(debug_assertions)]
@@ -229,48 +232,153 @@ async fn better_bangla_stt(
         .to_string())
 }
 
-/// Transcribe via ElevenLabs Scribe through the BizGrowHub proxy
-/// (POST /api/bizvoice/transcribe-scribe, authed with the user's JWT). Best
-/// Bangla accuracy; the language hint comes from the app's input_lang.
+// ── ElevenLabs Scribe (direct, multi-key) ───────────────────────────────────
+
+const EL_API: &str = "https://api.elevenlabs.io/v1";
+
+/// App language label / ISO-639-1 → ElevenLabs `language_code` (ISO-639-3).
+/// Scribe auto-detects, so this is only a hint and an unknown value is dropped.
+fn scribe_lang(lang: &str) -> Option<&'static str> {
+    match lang.to_lowercase().as_str() {
+        // Banglish is spoken Bangla; gpt_refine romanizes it afterwards.
+        "bangla" | "bn" | "ben" | "banglish" => Some("ben"),
+        "english" | "en" | "eng" => Some("eng"),
+        "hindi" | "hi" | "hin" => Some("hin"),
+        "urdu" | "ur" | "urd" => Some("urd"),
+        "arabic" | "ar" | "ara" => Some("ara"),
+        _ => None,
+    }
+}
+
+/// True when ElevenLabs is telling us this account is out of credits rather
+/// than that the key is wrong. It reports both as 400 *or* 401, so the body has
+/// to be inspected — status alone can't tell the two apart.
+fn is_quota_error(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    lower.contains("quota_exceeded") || lower.contains("insufficient")
+}
+
+/// Check one key and report its balance. Powers the per-key "Test" button.
+/// Never returns Err: a rejected key is a result to render, not a failure.
+pub async fn probe_elevenlabs_key(key: &str) -> Value {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{EL_API}/user/subscription"))
+        .header("xi-api-key", key)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await;
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => return serde_json::json!({ "ok": false, "error": format!("Network error: {e}") }),
+    };
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        let msg = if is_quota_error(&body) {
+            "Out of credits".to_string()
+        } else if status.as_u16() == 401 {
+            "Key rejected — check it was copied correctly".to_string()
+        } else {
+            let snippet: String = body.chars().take(160).collect();
+            format!("{status}: {snippet}")
+        };
+        return serde_json::json!({ "ok": false, "error": msg });
+    }
+
+    let data: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    serde_json::json!({
+        "ok": true,
+        "tier": data.get("tier").and_then(|v| v.as_str()).unwrap_or(""),
+        "charsUsed": data.get("character_count").and_then(|v| v.as_u64()),
+        "charsLimit": data.get("character_limit").and_then(|v| v.as_u64()),
+    })
+}
+
+/// One Scribe attempt with a single key. `Ok(text)` on success; `Err((msg,
+/// key_spent))` otherwise, where `key_spent` marks the errors worth failing
+/// over for rather than reporting immediately.
+async fn scribe_attempt(
+    client: &reqwest::Client,
+    key: &str,
+    audio: &[u8],
+    // 'static because reqwest's multipart text parts must own or outlive the
+    // request; every value comes from scribe_lang's fixed set of literals.
+    lang: Option<&'static str>,
+) -> Result<String, (String, bool)> {
+    let part = reqwest::multipart::Part::bytes(audio.to_vec())
+        .file_name("audio.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| (e.to_string(), false))?;
+    let mut form = reqwest::multipart::Form::new()
+        .text("model_id", "scribe_v1")
+        .part("file", part);
+    if let Some(code) = lang {
+        form = form.text("language_code", code);
+    }
+
+    let resp = client
+        .post(format!("{EL_API}/speech-to-text"))
+        .header("xi-api-key", key)
+        .multipart(form)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        // A network blip isn't this key's fault, but another key is on a fresh
+        // connection anyway, so it's still worth moving on.
+        .map_err(|e| (format!("Scribe request failed: {e}"), true))?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        let snippet: String = body.chars().take(200).collect();
+        let retryable =
+            is_quota_error(&body) || status.as_u16() == 401 || status.as_u16() == 429 || status.is_server_error();
+        return Err((format!("Scribe failed ({status}): {snippet}"), retryable));
+    }
+
+    let data: Value = serde_json::from_str(&body).map_err(|e| (e.to_string(), false))?;
+    Ok(data
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string())
+}
+
+/// Transcribe via ElevenLabs Scribe using the user's own keys, walking the list
+/// until one succeeds. A key that reports `quota_exceeded` is skipped and the
+/// same audio is retried on the next one, so a drained account costs the user
+/// a little latency instead of a failed dictation.
 async fn scribe_stt(
     client: &reqwest::Client,
     opts: &PipelineOpts,
     audio: &[u8],
 ) -> Result<String, String> {
-    let url = format!(
-        "{}/api/bizvoice/transcribe-scribe",
-        opts.api_base.trim_end_matches('/')
-    );
-    let part = reqwest::multipart::Part::bytes(audio.to_vec())
-        .file_name("audio.wav")
-        .mime_str("audio/wav")
-        .map_err(|e| e.to_string())?;
-    let form = reqwest::multipart::Form::new()
-        .text("language", opts.input_lang.to_lowercase())
-        .part("file", part);
+    let lang = scribe_lang(&opts.input_lang);
+    let mut last = "no ElevenLabs key configured".to_string();
 
-    let resp = client
-        .post(&url)
-        .bearer_auth(&opts.auth_token)
-        .multipart(form)
-        .timeout(Duration::from_secs(60))
-        .send()
-        .await
-        .map_err(|e| format!("Scribe STT request failed: {e}"))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        let snippet: String = body.chars().take(200).collect();
-        return Err(format!("Scribe STT failed ({status}): {snippet}"));
+    for (label, key) in &opts.elevenlabs_keys {
+        match scribe_attempt(client, key, audio, lang).await {
+            Ok(text) => return Ok(text),
+            Err((err, retryable)) => {
+                #[cfg(debug_assertions)]
+                eprintln!("[stt] scribe key {label:?} failed (retryable={retryable}): {err}");
+                if !retryable {
+                    return Err(err);
+                }
+                last = format!("{label}: {err}");
+            }
+        }
     }
 
-    let data: Value = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(data
-        .get("transcript")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string())
+    Err(format!(
+        "All {} ElevenLabs key(s) failed. Last error — {last}",
+        opts.elevenlabs_keys.len()
+    ))
 }
 
 /// GPT format/refine step (OpenAI-compatible chat/completions) using the active

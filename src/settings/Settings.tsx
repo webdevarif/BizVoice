@@ -140,6 +140,7 @@ export function Settings() {
   const [customHeaders, setCustomHeaders] = useState('');
   const [useBetterBangla, setUseBetterBangla] = useState(false);
   const [useScribe, setUseScribe] = useState(false);
+  const [elKeys, setElKeys] = useState<ElKey[]>([]);
   const [skipGpt, setSkipGpt] = useState(true); // AI Formatting off by default
   const [muteWhileRecording, setMuteWhileRecording] = useState(false);
   const [dictionary, setDictionary] = useState<DictEntry[]>([]);
@@ -225,6 +226,7 @@ export function Settings() {
       if (s.hasCustomKey) setCustomKey('••••••••••••••••••••');
       setUseBetterBangla(s.useBetterBangla ?? false);
       setUseScribe(s.useScribe ?? false);
+      setElKeys(readElKeys(s));
       setSkipGpt(s.skipGpt ?? true);
       setMuteWhileRecording(s.muteWhileRecording ?? false);
       setDictionary(s.dictionary || []);
@@ -330,6 +332,62 @@ export function Settings() {
       setToast({ kind: 'err', msg: err?.message ?? 'Save failed' });
     }
     setTimeout(() => setToast(null), 2000);
+  }
+
+  // ── ElevenLabs keys (repeater) ─────────────────────────────────────────────
+  // Rust owns the ciphertext; rows here carry only a masked `hint`, plus a
+  // transient `draft` while the user is typing a new key. Because the settings
+  // store replaces arrays wholesale, every mutation persists the FULL list.
+
+  function persistElKeys(next: ElKey[], msg: string) {
+    setElKeys(next);
+    // Strip UI-only fields, and send `key` only for rows holding a fresh draft —
+    // omitting it tells Rust to keep whatever ciphertext it already has.
+    const payload = next.map(({ id, draft }) => (
+      draft && !draft.startsWith('•') ? { id, key: draft.trim() } : { id }
+    ));
+    save({ elevenlabsKeys: payload }, msg);
+  }
+
+  function addElKey() {
+    // Date.now() is unique enough here: rows are only ever added by a human click.
+    const id = `el_${Date.now()}`;
+    setElKeys((prev) => [...prev, { id, hint: '', draft: '' }]);
+  }
+
+  function updateElKey(id: string, patch: Partial<ElKey>) {
+    setElKeys((prev) => prev.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  }
+
+  async function saveElKey(id: string, raw: string) {
+    const t = raw.trim();
+    if (!t || t.startsWith('•')) { flash('err', 'Please enter a key'); return; }
+    const next = elKeys.map((r) => (r.id === id ? { ...r, draft: t, status: undefined, error: undefined } : r));
+    persistElKeys(next, 'ElevenLabs key saved');
+    // Reload so the row picks up the masked hint Rust generated and drops the draft.
+    const s: any = await window.api.getSettings();
+    setElKeys(readElKeys(s));
+  }
+
+  function removeElKey(id: string) {
+    persistElKeys(elKeys.filter((r) => r.id !== id), 'Key removed');
+  }
+
+  async function testElKey(id: string) {
+    updateElKey(id, { testing: true, status: undefined, error: undefined });
+    try {
+      const res = await window.api.testElevenLabsKey(id);
+      updateElKey(id, {
+        testing: false,
+        status: res.ok ? 'ok' : 'fail',
+        error: res.ok ? undefined : res.error,
+        tier: res.tier,
+        charsUsed: res.charsUsed ?? undefined,
+        charsLimit: res.charsLimit ?? undefined,
+      });
+    } catch (err: any) {
+      updateElKey(id, { testing: false, status: 'fail', error: err?.message ?? 'Test failed' });
+    }
   }
 
   async function saveApiKey() {
@@ -595,6 +653,58 @@ export function Settings() {
                   whatever OpenAI/Groq key is set for the Whisper step. */}
               {!useLocalWhisper && (
                 <>
+                  {/* Premium STT — the user's own ElevenLabs account(s). Sits above
+                      the provider picker because when it's on it overrides that
+                      choice for transcription entirely. Multiple keys are tried in
+                      order, so one account running dry doesn't stop dictation. */}
+                  <Card>
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <Label>ElevenLabs Scribe (Premium)</Label>
+                        <HelpText>
+                          The most accurate model, especially for Bangla. Uses your own ElevenLabs account — create one at elevenlabs.io, then paste an API key below. Add several and BizVoice moves to the next when one runs out of credits.
+                        </HelpText>
+                      </div>
+                      <Toggle
+                        on={useScribe}
+                        onClick={() => {
+                          const v = !useScribe;
+                          setUseScribe(v);
+                          save({ useScribe: v }, v ? 'Premium (Scribe) enabled' : 'Scribe off');
+                        }}
+                      />
+                    </div>
+
+                    {useScribe && (
+                      <div className="mt-3 space-y-2">
+                        {elKeys.length === 0 && (
+                          <div className="text-[11px] text-amber-400/80">
+                            No key yet — premium transcription can't run until you add one.
+                          </div>
+                        )}
+
+                        {elKeys.map((row, i) => (
+                          <ElKeyRow
+                            key={row.id}
+                            row={row}
+                            index={i}
+                            onChange={(patch) => updateElKey(row.id, patch)}
+                            onSave={(raw) => saveElKey(row.id, raw)}
+                            onRemove={() => removeElKey(row.id)}
+                            onTest={() => testElKey(row.id)}
+                          />
+                        ))}
+
+                        <button
+                          onClick={addElKey}
+                          className="w-full px-2 py-2 rounded-md text-[12px] font-semibold border border-dashed border-white/15 text-white/60 hover:text-white hover:border-white/30 transition-colors"
+                        >
+                          + Add another key
+                        </button>
+                      </div>
+                    )}
+                  </Card>
+
                   <Card>
                     <Label>Provider</Label>
                     <HelpText>One provider powers transcription, AI formatting, and refine. OpenRouter & Custom are chat-only — STT falls back to your OpenAI or Groq key.</HelpText>
@@ -873,19 +983,6 @@ export function Settings() {
                 )}
               </Card>
 
-              {/* Premium STT — ElevenLabs Scribe via the BizGrowHub proxy.
-                  Best accuracy (incl. Bangla); same login, no extra key. */}
-              <Card>
-                <div className="flex items-center justify-between">
-                  <div>
-                    <Label>Premium transcription (Scribe)</Label>
-                    <HelpText>
-                      Routes audio through ElevenLabs Scribe on the BizGrowHub backend — the most accurate model, especially for Bangla. No extra token; works with your login. Overrides the options above when on.
-                    </HelpText>
-                  </div>
-                  <Toggle on={useScribe} onClick={() => { const v = !useScribe; setUseScribe(v); save({ useScribe: v }, v ? 'Premium (Scribe) enabled' : 'Scribe off'); }} />
-                </div>
-              </Card>
             </Section>
           )}
 
@@ -1324,6 +1421,101 @@ function Section({ title, description, children }: { title: string; description:
 }
 function Card({ children }: { children: React.ReactNode }) {
   return <div className="bg-white/[0.02] border border-white/5 rounded-lg px-4 py-3.5">{children}</div>;
+}
+
+// ── ElevenLabs key repeater ──────────────────────────────────────────────────
+
+/** One row of the ElevenLabs key list. `hint` comes from Rust (masked); `draft`
+ *  only exists while the user is typing a replacement. Test results are held
+ *  in-memory — they're a live probe, not persisted state. */
+interface ElKey {
+  id: string;
+  hint: string;
+  draft?: string;
+  testing?: boolean;
+  status?: 'ok' | 'fail';
+  error?: string;
+  tier?: string;
+  charsUsed?: number;
+  charsLimit?: number;
+}
+
+/** Read the key list out of a settings payload, tolerating an absent/legacy field. */
+function readElKeys(s: any): ElKey[] {
+  const raw = Array.isArray(s?.elevenlabsKeys) ? s.elevenlabsKeys : [];
+  return raw.map((r: any, i: number) => ({
+    id: String(r?.id ?? `el_${i}`),
+    hint: String(r?.hint ?? ''),
+  }));
+}
+
+const nfmt = new Intl.NumberFormat('en-US');
+
+function ElKeyRow({ row, index, onChange, onSave, onRemove, onTest }: {
+  row: ElKey;
+  index: number;
+  onChange: (patch: Partial<ElKey>) => void;
+  onSave: (raw: string) => void;
+  onRemove: () => void;
+  onTest: () => void;
+}) {
+  // A saved row shows its mask until the user clicks Change (which sets draft='').
+  const editing = row.draft !== undefined || !row.hint;
+  const remaining =
+    row.charsUsed != null && row.charsLimit != null
+      ? Math.max(row.charsLimit - row.charsUsed, 0)
+      : null;
+
+  return (
+    <div className="bg-white/[0.02] border border-white/5 rounded-md px-3 py-2.5">
+      <div className="flex items-center gap-2">
+        <span className="text-[10px] text-white/30 w-4 shrink-0">{index + 1}.</span>
+        {editing ? (
+          <>
+            <input
+              value={row.draft ?? ''}
+              onChange={(e) => onChange({ draft: e.target.value })}
+              placeholder="sk_..."
+              type="password"
+              className="flex-1 min-w-0 bg-[#1a1a22] border border-white/10 rounded px-2 py-1.5 text-[12px] font-mono outline-none focus:border-blue-500"
+            />
+            <button
+              onClick={() => onSave(row.draft ?? '')}
+              className="shrink-0 px-2.5 py-1.5 rounded bg-blue-600 hover:bg-blue-500 text-white text-[11px] font-semibold"
+            >Save</button>
+          </>
+        ) : (
+          <>
+            <span className="flex-1 min-w-0 truncate text-[12px] font-mono text-white/50">{row.hint}</span>
+            <button
+              onClick={() => onChange({ draft: '' })}
+              className="shrink-0 px-2.5 py-1.5 rounded bg-white/5 hover:bg-white/10 text-white/70 text-[11px]"
+            >Change</button>
+            <button
+              onClick={onTest}
+              disabled={row.testing}
+              className="shrink-0 px-2.5 py-1.5 rounded bg-white/5 hover:bg-white/10 text-white/70 text-[11px] disabled:opacity-50"
+            >{row.testing ? 'Testing…' : 'Test'}</button>
+          </>
+        )}
+        <button
+          onClick={onRemove}
+          aria-label={`Remove key ${index + 1}`}
+          className="shrink-0 px-2 py-1.5 rounded bg-red-600/15 hover:bg-red-600/30 text-red-400 text-[11px]"
+        >Remove</button>
+      </div>
+
+      {row.status === 'ok' && (
+        <div className="text-[11px] text-green-400 mt-1.5 ml-6">
+          ✓ Working{row.tier ? ` — ${row.tier}` : ''}
+          {remaining !== null ? ` · ${nfmt.format(remaining)} credits left` : ''}
+        </div>
+      )}
+      {row.status === 'fail' && (
+        <div className="text-[11px] text-red-400 mt-1.5 ml-6">✕ {row.error ?? 'Test failed'}</div>
+      )}
+    </div>
+  );
 }
 function Label({ children, colorClass = 'text-white/85' }: { children: React.ReactNode; colorClass?: string }) {
   return <div className={`text-xs font-semibold ${colorClass} mb-1`}>{children}</div>;

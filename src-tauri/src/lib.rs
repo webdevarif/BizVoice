@@ -1,3 +1,8 @@
+// The default of 128 is not enough for `default_settings()`'s `json!` literal in
+// commands.rs — serde_json expands one recursion level per key, so adding a
+// field there is what tips it over.
+#![recursion_limit = "256"]
+
 // BizVoice — Tauri Phase 0 spike.
 //
 // Goal of this file right now is ONLY to de-risk the migration:
@@ -190,6 +195,7 @@ pub fn run() {
             // Phase 2 skeleton — settings & windows
             commands::get_settings,
             commands::set_settings,
+            commands::test_elevenlabs_key,
             commands::open_settings,
             commands::close_window,
             commands::minimize_window,

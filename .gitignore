@@ -39,3 +39,6 @@ backup
 
 # transient temp folders
 96c2a791abee29ad7c63bb48c753df395a24e7ab0d6091dfcf626690878a75fc
+
+# Local scratch file holding real ElevenLabs API keys — never commit.
+ElevenLabs-Api-keys.md

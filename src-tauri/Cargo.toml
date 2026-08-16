@@ -1,6 +1,6 @@
 [package]
 name = "bizvoice"
-version = "0.1.25"
+version = "0.1.26"
 description = "BizVoice - AI voice typing (Tauri)"
 authors = ["BizVoice"]
 edition = "2021"

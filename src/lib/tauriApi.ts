@@ -52,6 +52,8 @@ const api: Window['api'] = {
   // ── Settings & windows ──
   getSettings: () => invoke('get_settings'),
   setSettings: (patch: any) => invoke('set_settings', { patch }),
+  // Takes the row id, not the key — the plaintext stays in Rust.
+  testElevenLabsKey: (id: string) => invoke('test_elevenlabs_key', { id }),
   openSettings: () => invoke('open_settings'),
   closeWindow: () => invoke('close_window'),
   minimizeWindow: () => invoke('minimize_window'),
@@ -148,6 +150,13 @@ declare global {
     api: {
       getSettings: () => Promise<any>;
       setSettings: (patch: any) => Promise<any>;
+      testElevenLabsKey: (id: string) => Promise<{
+        ok: boolean;
+        tier?: string;
+        charsUsed?: number | null;
+        charsLimit?: number | null;
+        error?: string;
+      }>;
       openSettings: () => Promise<void>;
       closeWindow: () => Promise<void>;
       minimizeWindow: () => Promise<void>;

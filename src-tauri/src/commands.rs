@@ -166,6 +166,134 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+// ── ElevenLabs keys (user-supplied, multiple, with failover) ────────────────
+//
+// Unlike the single-string provider keys above, premium Scribe holds a LIST of
+// the user's own ElevenLabs keys so dictation can fail over when one account
+// runs out of credits. Stored under `elevenlabsKeys` as
+//   [{ id, label, keyEncrypted, status, tier, charsUsed, charsLimit, testedAt }]
+// The plaintext never reaches the WebView: `get_settings` swaps `keyEncrypted`
+// for a masked `hint`, and `set_settings` restores the stored value by `id` for
+// any row the UI sends back unchanged.
+
+pub const EL_KEYS_FIELD: &str = "elevenlabsKeys";
+
+/// "sk_1••••••cdef" — enough to tell two accounts apart, useless if leaked.
+fn mask_key(raw: &str) -> String {
+    let n = raw.chars().count();
+    if n <= 8 {
+        return "•".repeat(n);
+    }
+    let head: String = raw.chars().take(4).collect();
+    let tail: String = raw.chars().skip(n - 4).collect();
+    format!("{head}{}{tail}", "•".repeat(6))
+}
+
+/// Strip decryptable material out of the ElevenLabs key list before it is handed
+/// to the WebView, replacing each `keyEncrypted` with a display-only `hint`.
+fn sanitize_elevenlabs_keys(s: &mut Value) {
+    use base64::Engine;
+    let Some(arr) = s.get_mut(EL_KEYS_FIELD).and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    for entry in arr.iter_mut() {
+        let Some(obj) = entry.as_object_mut() else { continue };
+        let plain = obj
+            .remove("keyEncrypted")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .and_then(|enc| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(enc.as_bytes())
+                    .ok()
+            })
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_default();
+        obj.insert("hint".into(), Value::String(mask_key(&plain)));
+    }
+}
+
+/// Reconcile an incoming `elevenlabsKeys` patch with what is already stored.
+///
+/// The UI only ever holds masked hints, so a row it sends back without a `key`
+/// means "unchanged" — its stored ciphertext is looked up by `id` and carried
+/// over. A row carrying a plaintext `key` is newly entered and gets encoded.
+/// Rows the UI omitted are simply gone (the array replaces wholesale), which is
+/// how deletion works.
+fn merge_elevenlabs_keys(existing: &Value, patch: &mut Value) {
+    use base64::Engine;
+    let stored = existing
+        .get(EL_KEYS_FIELD)
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let Some(incoming) = patch.get_mut(EL_KEYS_FIELD).and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+
+    for entry in incoming.iter_mut() {
+        let Some(obj) = entry.as_object_mut() else { continue };
+        // `hint` is display-only; never let it round-trip into storage.
+        obj.remove("hint");
+        let id = obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        match obj.remove("key").and_then(|v| v.as_str().map(str::to_string)) {
+            Some(raw) if !raw.is_empty() => {
+                let enc = base64::engine::general_purpose::STANDARD.encode(raw.as_bytes());
+                obj.insert("keyEncrypted".into(), Value::String(enc));
+            }
+            _ => {
+                let carried = stored
+                    .iter()
+                    .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+                    .and_then(|e| e.get("keyEncrypted"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                obj.insert("keyEncrypted".into(), Value::String(carried));
+            }
+        }
+    }
+}
+
+/// The user's ElevenLabs keys as `(label, plaintext)`, in stored order — which
+/// is the order the transcription pipeline tries them in. Rows whose ciphertext
+/// is missing or corrupt are skipped rather than attempted and failed.
+///
+/// The label is derived from position and the masked key rather than stored,
+/// since it exists only to make error messages traceable ("which key failed?")
+/// and asking the user to name each account earned nothing.
+pub fn decode_elevenlabs_keys(settings: &Value) -> Vec<(String, String)> {
+    use base64::Engine;
+    settings
+        .get(EL_KEYS_FIELD)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .enumerate()
+                .filter_map(|(i, e)| {
+                    let enc = e.get("keyEncrypted")?.as_str()?;
+                    if enc.is_empty() {
+                        return None;
+                    }
+                    let raw = base64::engine::general_purpose::STANDARD
+                        .decode(enc.as_bytes())
+                        .ok()
+                        .and_then(|b| String::from_utf8(b).ok())?;
+                    if raw.is_empty() {
+                        return None;
+                    }
+                    Some((format!("key {} ({})", i + 1, mask_key(&raw)), raw))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Decode a base64-obfuscated `*Encrypted` key field back to plaintext.
 fn decode_key(settings: &Value, enc_field: &str) -> String {
     use base64::Engine;
@@ -216,6 +344,9 @@ fn default_settings() -> Value {
         "customKeyEncrypted": "",
         "useBetterBangla": false,
         "useScribe": false,
+        // The user's own ElevenLabs keys, tried in order with failover.
+        "elevenlabsKeys": [],
+        "scribeMigratedV2": false,
         "customBaseUrl": "",
         "customChatModel": "",
         "customHeaders": "",
@@ -269,6 +400,78 @@ fn default_modes() -> Value {
     ])
 }
 
+/// Verify one stored ElevenLabs key against the live API and report its credit
+/// balance. Takes an `id` rather than the key itself so the plaintext never has
+/// to travel back out through the WebView just to be checked.
+///
+/// Returns `{ ok, tier?, charsUsed?, charsLimit?, error? }` — never an Err for a
+/// rejected key, since "this key is bad" is a result the UI renders, not a
+/// command failure.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn test_elevenlabs_key(app: tauri::AppHandle, id: String) -> Result<Value, String> {
+    let settings = {
+        let store = app.store(SETTINGS_STORE).map_err(|e| e.to_string())?;
+        let mut s = default_settings();
+        if let Some(stored) = store.get(SETTINGS_KEY) {
+            merge_into(&mut s, &stored);
+        }
+        s
+    };
+
+    let key = settings
+        .get(EL_KEYS_FIELD)
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+        })
+        .map(|e| {
+            use base64::Engine;
+            let enc = e.get("keyEncrypted").and_then(|v| v.as_str()).unwrap_or("");
+            base64::engine::general_purpose::STANDARD
+                .decode(enc.as_bytes())
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+
+    if key.is_empty() {
+        return Ok(json!({ "ok": false, "error": "No key saved for this row" }));
+    }
+
+    Ok(crate::pipeline::probe_elevenlabs_key(&key).await)
+}
+
+/// One-time migration for the move to user-supplied ElevenLabs keys.
+///
+/// Premium STT used to run on a server-side key, so `useScribe` alone was
+/// enough to enable it. Now it needs the user's own key, and an upgraded
+/// install would otherwise sit with premium "on" and nothing behind it —
+/// every dictation failing. Turn it back off once; the user re-enables it
+/// after adding a key. Anyone who already has a key is left alone.
+fn migrate_scribe_settings(store: &std::sync::Arc<tauri_plugin_store::Store<tauri::Wry>>, settings: &mut Value) {
+    let done = settings
+        .get("scribeMigratedV2")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if done {
+        return;
+    }
+
+    let on = settings.get("useScribe").and_then(|v| v.as_bool()).unwrap_or(false);
+    let has_keys = !decode_elevenlabs_keys(settings).is_empty();
+
+    if let Some(obj) = settings.as_object_mut() {
+        if on && !has_keys {
+            obj.insert("useScribe".into(), Value::Bool(false));
+        }
+        obj.insert("scribeMigratedV2".into(), Value::Bool(true));
+    }
+    store.set(SETTINGS_KEY, settings.clone());
+    let _ = store.save();
+}
+
 #[tauri::command]
 pub fn get_settings(app: tauri::AppHandle) -> Result<Value, String> {
     let store = app.store(SETTINGS_STORE).map_err(|e| e.to_string())?;
@@ -281,7 +484,11 @@ pub fn get_settings(app: tauri::AppHandle) -> Result<Value, String> {
             let _ = store.save();
         }
     }
+    migrate_scribe_settings(&store, &mut settings);
     add_key_flags(&mut settings);
+    // Must be the last step: swaps every ElevenLabs ciphertext for a masked
+    // hint, so no usable key is ever handed to the WebView.
+    sanitize_elevenlabs_keys(&mut settings);
     Ok(settings)
 }
 
@@ -290,6 +497,9 @@ pub fn set_settings(app: tauri::AppHandle, mut patch: Value) -> Result<Value, St
     obfuscate_keys(&mut patch);
     let store = app.store(SETTINGS_STORE).map_err(|e| e.to_string())?;
     let mut current = store.get(SETTINGS_KEY).unwrap_or_else(default_settings);
+    // Resolve the ElevenLabs list against what's stored BEFORE merging, since
+    // the array replaces wholesale and the UI only ever holds masked hints.
+    merge_elevenlabs_keys(&current, &mut patch);
     merge_into(&mut current, &patch);
     // Capture appearance values from the merged result before it's moved into the
     // store, so we can push them to the mic bar below.
@@ -549,6 +759,7 @@ pub async fn transcribe(
         vocabulary: str_field("vocabulary", ""),
         use_scribe: s.get("useScribe").and_then(|v| v.as_bool()).unwrap_or(false),
         use_better_bangla: s.get("useBetterBangla").and_then(|v| v.as_bool()).unwrap_or(false),
+        elevenlabs_keys: decode_elevenlabs_keys(&s),
         auth_token: decode_key(&s, "bizgrowhubTokenEncrypted"),
         api_base: api_base(),
     };
@@ -1706,6 +1917,14 @@ const SILENCE_TRIGGER_MS: i64 = 1800;
 /// Minimum transcript length (chars) we consider "actual voice" for the
 /// silence heuristic. Short blips ("ok", "uh", "ওহে") are ignored.
 const MIN_MEANINGFUL_LEN: usize = 4;
+/// Sliding window for FAST partials — transcribe only the last ~5s so interim
+/// text stays snappy no matter how long the current utterance runs (Tier-1).
+const PARTIAL_WINDOW_BYTES: usize = 160_000; // ~5s @ 16 kHz mono 16-bit PCM
+/// Hard cap on the un-committed buffer. If speech runs this long without a
+/// natural ≥SILENCE_TRIGGER_MS pause, force an accurate final (commit + clear)
+/// so NO pass ever transcribes more than ~10s — this is what stops the
+/// escalating latency on long, pause-free dictation.
+const MAX_BUFFER_BYTES: usize = 320_000; // ~10s
 
 #[derive(Default)]
 pub(crate) struct StreamSession {
@@ -1747,6 +1966,50 @@ fn concat_chunks(chunks: &[Vec<u8>]) -> Vec<u8> {
     for c in chunks {
         buf.extend(c.as_slice());
     }
+    buf
+}
+
+/// Byte offset where PCM data starts in a (multi-chunk) WAV buffer. Locates the
+/// "data" sub-chunk near the front; falls back to the canonical 44-byte header.
+fn wav_pcm_start(all: &[u8]) -> usize {
+    let scan = &all[..all.len().min(256)];
+    scan.windows(4)
+        .position(|w| w == b"data")
+        .map(|p| p + 8)
+        .unwrap_or(44)
+}
+
+/// Build ONE self-consistent WAV from the session's chunks. The wav encoder
+/// emits chunk[0] with the header and the rest as raw PCM continuation, so a
+/// plain concat has stale RIFF/data sizes (some server decoders truncate on
+/// that → dropped audio). We rewrite both size fields to match the real PCM.
+/// When `tail_bytes` is set, only the last N bytes of PCM are kept — a sliding
+/// window that keeps fast partials cheap on a long utterance.
+fn build_wav(chunks: &[Vec<u8>], tail_bytes: Option<usize>) -> Vec<u8> {
+    let all = concat_chunks(chunks);
+    let hdr = wav_pcm_start(&all);
+    if all.len() <= hdr {
+        return all;
+    }
+    let header = &all[..hdr];
+    let pcm_full = &all[hdr..];
+    let pcm = match tail_bytes {
+        Some(n) if pcm_full.len() > n => {
+            let mut start = pcm_full.len() - n;
+            start -= start % 2; // keep 16-bit sample alignment
+            &pcm_full[start..]
+        }
+        _ => pcm_full,
+    };
+    let mut buf = Vec::with_capacity(hdr + pcm.len());
+    buf.extend_from_slice(header);
+    buf.extend_from_slice(pcm);
+    let pcm_len = pcm.len() as u32;
+    // RIFF chunk size = whole file minus the 8-byte "RIFF"+size prefix.
+    let riff = ((hdr as u32).saturating_sub(8)).wrapping_add(pcm_len);
+    buf[4..8].copy_from_slice(&riff.to_le_bytes());
+    // data sub-chunk size sits in the 4 bytes immediately before the PCM.
+    buf[hdr - 4..hdr].copy_from_slice(&pcm_len.to_le_bytes());
     buf
 }
 
@@ -1858,6 +2121,12 @@ fn build_opts(
         vocabulary,
         use_scribe,
         use_better_bangla,
+        // Empty in fast-partial mode, where use_scribe is forced off anyway.
+        elevenlabs_keys: if use_scribe {
+            decode_elevenlabs_keys(s)
+        } else {
+            Vec::new()
+        },
         auth_token: decode_key(s, "bizgrowhubTokenEncrypted"),
         api_base: api_base(),
     }
@@ -2071,12 +2340,18 @@ pub async fn stream_audio_chunk(
         let Some(sess) = map.get_mut(&session_id) else {
             return Ok(json!({ "ok": true }));
         };
-        if let Some(bytes) = base64::engine::general_purpose::STANDARD
-            .decode(audio_base64.as_bytes())
-            .ok()
-            .filter(|b| !b.is_empty())
-        {
-            sess.chunks.push(bytes);
+        // On the stop marker (is_final) the frontend no longer resends the whole
+        // recording — the backend already holds every incremental chunk, so we
+        // must NOT append here (that doubled the tail audio → slow, garbled
+        // finals). Only accumulate live chunks.
+        if !is_final {
+            if let Some(bytes) = base64::engine::general_purpose::STANDARD
+                .decode(audio_base64.as_bytes())
+                .ok()
+                .filter(|b| !b.is_empty())
+            {
+                sess.chunks.push(bytes);
+            }
         }
         let total_bytes: usize = sess.chunks.iter().map(|c| c.len()).sum();
         let interval_gap = now - sess.last_partial_ms;
@@ -2088,7 +2363,7 @@ pub async fn stream_audio_chunk(
         let sr = !sess.in_flight
             && !sess.final_pending
             && total_bytes >= MIN_PARTIAL_BYTES
-            && silence_gap >= SILENCE_TRIGGER_MS;
+            && (silence_gap >= SILENCE_TRIGGER_MS || total_bytes >= MAX_BUFFER_BYTES);
         if pr {
             sess.in_flight = true;
             sess.last_partial_ms = now;
@@ -2118,7 +2393,7 @@ pub async fn stream_audio_chunk(
             let Some(sess) = map.get(&sid) else {
                 return Ok(json!({ "ok": true }));
             };
-            let buf = concat_chunks(&sess.chunks);
+            let buf = build_wav(&sess.chunks, Some(PARTIAL_WINDOW_BYTES));
             let lang = sess.language.clone();
             let store = match app.store(SETTINGS_STORE).map_err(|e| e.to_string()) {
                 Ok(st) => st,
@@ -2193,7 +2468,7 @@ pub async fn stream_audio_chunk(
             let Some(sess) = map.get(&sid) else {
                 return Ok(json!({ "ok": true }));
             };
-            let buf = concat_chunks(&sess.chunks);
+            let buf = build_wav(&sess.chunks, None);
             let lang = sess.language.clone();
             if buf.len() < 1000 {
                 drop(map);
@@ -2263,31 +2538,37 @@ pub async fn stream_audio_chunk(
         let maybe_buf = if let Ok(mut map) = sessions.0.lock() {
             map.remove(&session_id).map(|sess| {
                 let pref_lang = sess.language.clone();
-                (concat_chunks(&sess.chunks), pref_lang)
+                (build_wav(&sess.chunks, None), pref_lang)
             })
         } else {
             None
         };
 
-        if let Some((buf, pref_lang)) = maybe_buf {
-            if buf.len() > 1000 {
-                let sid = session_id.clone();
-                let app = app.clone();
-                let snap = s.clone();
-                tauri::async_runtime::spawn(async move {
-                    let raw = run_accurate_final(&app, buf, snap.clone(), pref_lang)
-                        .await
-                        .unwrap_or_default();
-                    let final_text = apply_dictionary(&raw, &snap);
-                    if !final_text.trim().is_empty() {
-                        let _ = app.emit_to(
-                            "voiceengine",
-                            "transcript:final",
-                            json!({ "sessionId": sid, "text": final_text }),
-                        );
-                    }
-                });
-            }
+        // Always emit a final for the stop marker (even empty text) so the
+        // window leaves "processing" as soon as the tail is done instead of
+        // waiting out its safety cap.
+        let has_tail = maybe_buf.as_ref().map_or(false, |(b, _)| b.len() > 1000);
+        if let (true, Some((buf, pref_lang))) = (has_tail, maybe_buf) {
+            let sid = session_id.clone();
+            let app = app.clone();
+            let snap = s.clone();
+            tauri::async_runtime::spawn(async move {
+                let raw = run_accurate_final(&app, buf, snap.clone(), pref_lang)
+                    .await
+                    .unwrap_or_default();
+                let final_text = apply_dictionary(&raw, &snap);
+                let _ = app.emit_to(
+                    "voiceengine",
+                    "transcript:final",
+                    json!({ "sessionId": sid, "text": final_text }),
+                );
+            });
+        } else {
+            let _ = app.emit_to(
+                "voiceengine",
+                "transcript:final",
+                json!({ "sessionId": session_id, "text": "" }),
+            );
         }
     }
 
