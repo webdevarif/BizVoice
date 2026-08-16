@@ -19,6 +19,7 @@ mod commands;
 mod overlay;
 mod paste;
 mod pipeline;
+mod realtime;
 mod whisper;
 
 /// Trivial round-trip so the frontend can confirm the Rust backend is reachable.
@@ -176,6 +177,7 @@ pub fn run() {
         .manage(whisper::WhisperCache::default())
         .manage(commands::PendingUpdate::default())
         .manage(commands::StreamSessions::default())
+        .manage(commands::LiveState::default())
         .setup(|app| {
             // Register the user's configured hotkeys (toggle / PTT / cycle) read
             // from settings, recording them in HotkeyState for the handler above.
@@ -196,6 +198,9 @@ pub fn run() {
             commands::get_settings,
             commands::set_settings,
             commands::test_elevenlabs_key,
+            commands::live_start,
+            commands::live_push,
+            commands::live_stop,
             commands::open_settings,
             commands::close_window,
             commands::minimize_window,

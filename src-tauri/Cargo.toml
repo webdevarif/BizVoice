@@ -1,6 +1,6 @@
 [package]
 name = "bizvoice"
-version = "0.1.26"
+version = "0.1.27"
 description = "BizVoice - AI voice typing (Tauri)"
 authors = ["BizVoice"]
 edition = "2021"
@@ -27,6 +27,14 @@ tauri-plugin-global-shortcut = "2"
 reqwest = { version = "0.12", default-features = false, features = ["multipart", "json", "rustls-tls"] }
 base64 = "0.22"
 regex = "1"
+# Live transcription (ElevenLabs realtime STT over WSS). rustls to match the
+# reqwest backend above — rustls 0.23 / tokio-rustls 0.26 are already in the
+# lock via reqwest, so this adds no second TLS stack. `tokio` and `futures-util`
+# are likewise already present transitively; named here because the realtime
+# module uses mpsc and StreamExt/SinkExt directly.
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 # Phase 3/5 plugins: auth links, update prompts, auto-update, autostart, single-instance, clipboard.
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"

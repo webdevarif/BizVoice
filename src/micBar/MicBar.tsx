@@ -130,6 +130,14 @@ function drawMicHistory(canvas: HTMLCanvasElement, hist: number[]) {
 
 export function MicBar() {
   const [state,     setState]     = useState<State>('idle');
+  /**
+   * What the realtime socket has produced so far, for display only — never
+   * pasted. Committed phrases are kept separately from the in-progress partial
+   * because a partial resets to '' the moment its phrase commits; showing only
+   * the partial would blank the bar between every sentence.
+   */
+  const [liveDone,  setLiveDone]  = useState('');
+  const [livePart,  setLivePart]  = useState('');
   const [error,     setError]     = useState('');
   const [hasKey,    setHasKey]    = useState(true);
   const [animPhase, setAnimPhase] = useState<'hidden' | 'entering' | 'visible'>('hidden');
@@ -159,6 +167,12 @@ export function MicBar() {
   const hasKeyRef = useRef(true);
   stateRef.current  = state;
   hasKeyRef.current = hasKey;
+
+  // `state` only becomes 'recording' after the mic, the socket handshake and
+  // the worklet module have all resolved. Two hotkey presses inside that window
+  // would both see 'idle' and start a second session on top of the first,
+  // orphaning its stream and AudioContext. One boolean closes the window.
+  const startingRef = useRef(false);
 
   async function refreshSettings() {
     const s = await window.api.getSettings();
@@ -196,6 +210,23 @@ export function MicBar() {
     // never fires — the push from set_settings is what actually keeps the
     // "No API Key" state current after the user saves a key.
     const removeSettings = window.api.onSettingsChange?.(() => { refreshSettings(); });
+    // Partials are display-only and are replaced wholesale as the server
+    // revises its guess; the pasted text comes from live_stop, not from these.
+    const removeLive = window.api.onLivePartial?.((text) => { setLivePart(text ?? ''); });
+    // A commit finalises the phrase the partials were guessing at, so it moves
+    // from the partial slot into the settled text.
+    const removeLiveDone = window.api.onLiveCommitted?.((text) => {
+      const t = (text ?? '').trim();
+      setLivePart('');
+      if (t) setLiveDone(prev => (prev ? `${prev} ${t}` : t));
+    });
+    // The socket only reports terminal errors — a close with a reason, or a
+    // read failure. Either way the session is over, so stop now: every further
+    // word would go into a dead socket and be lost without the user knowing.
+    const removeLiveErr = window.api.onLiveError?.((msg) => {
+      liveErrRef.current = msg || 'Live transcription dropped';
+      if (liveNodeRef.current) void stopLiveRecording();
+    });
     refreshSettings();
     window.addEventListener('focus', refreshSettings);
     return () => {
@@ -204,6 +235,9 @@ export function MicBar() {
       removePttStop();
       removeAppearance();
       removeSettings?.();
+      removeLive?.();
+      removeLiveDone?.();
+      removeLiveErr?.();
       window.removeEventListener('focus', refreshSettings);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -484,25 +518,145 @@ export function MicBar() {
     }
   }
 
+  // ── Live preview (ElevenLabs realtime) ───────────────────────────────────
+  //
+  // Streams 16 kHz PCM straight to the realtime socket and shows partials as
+  // they land. Nothing is pasted until the user stops — the committed segments
+  // are joined, refined and pasted once, exactly as the batch path does. That
+  // keeps the paste, refine, dictionary and Banglish behaviour identical; the
+  // only thing that changes is that the user can see the text forming.
+
+  const liveNodeRef = useRef<AudioWorkletNode | null>(null);
+  /** Set when the socket dies; shown after the salvaged text is pasted. */
+  const liveErrRef  = useRef<string>('');
+
+  async function startLiveRecording(s: Awaited<ReturnType<typeof window.api.getSettings>>) {
+    if (s.muteWhileRecording) window.api.muteSystem(true);
+    const stream = await getMicStream(s);
+    streamRef.current = stream;
+
+    // Open the socket BEFORE touching audio: if no key connects, fall back to
+    // the batch recorder rather than dropping the user's words on the floor.
+    await window.api.liveStart(s.inputLang);
+
+    startAnalyser(stream);
+    const ctx = audioCtxRef.current!;
+    await ctx.audioWorklet.addModule('/pcm16-worklet.js');
+    const node = new AudioWorkletNode(ctx, 'pcm16');
+    liveNodeRef.current = node;
+
+    node.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
+      const bytes = new Uint8Array(e.data);
+      let bin = '';
+      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      // Fire-and-forget: awaiting here would let a slow IPC back up the audio
+      // thread's message queue.
+      window.api.livePush(btoa(bin)).catch(() => {});
+    };
+
+    ctx.createMediaStreamSource(stream).connect(node);
+    // Not connected to the destination — this taps audio, it doesn't play it.
+
+    setLiveDone('');
+    setLivePart('');
+    liveErrRef.current = '';
+    recStartRef.current = Date.now();
+    setState('recording');
+  }
+
+  async function stopLiveRecording() {
+    // Single entry: the hotkey and the socket-death handler can both land here,
+    // and stopping twice would call live_stop on an already-taken session.
+    const node = liveNodeRef.current;
+    if (!node) return;
+    liveNodeRef.current = null;
+
+    node.port.postMessage('stop');
+    node.disconnect();
+    stopAnalyser();
+    stopStream();
+    window.api.muteSystem(false);
+
+    const durationMs = recStartRef.current ? Date.now() - recStartRef.current : 0;
+    setState('processing');
+    try {
+      const text = await window.api.liveStop(undefined, durationMs);
+      setLiveDone('');
+      setLivePart('');
+      if (text) {
+        setState('done');
+        await window.api.paste(text);
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      // A death mid-dictation still pastes what survived, but the transcript is
+      // truncated — refined into a well-formed sentence, so it reads complete.
+      // Say so rather than letting it pass as a finished dictation.
+      if (liveErrRef.current) {
+        setError(liveErrRef.current);
+        liveErrRef.current = '';
+        setState('error');
+        setTimeout(() => setState('idle'), 3000);
+        return;
+      }
+      setState('idle');
+    } catch (err: any) {
+      setLiveDone('');
+      setLivePart('');
+      liveErrRef.current = '';
+      setError(err?.message || 'Live transcription failed');
+      setState('error');
+      setTimeout(() => setState('idle'), 3000);
+    }
+  }
+
   // ── unified API ──────────────────────────────────────────────────────────
 
   async function startRecording() {
+    if (startingRef.current) return;
+    startingRef.current = true;
     try {
       setError('');
       const s = await window.api.getSettings();
+      // Live preview needs premium Scribe and a key. Local mode wins over it,
+      // exactly as it does on the batch path (transcribe resolves the on-device
+      // model before it ever reaches the Scribe branch) — otherwise choosing
+      // "Private, offline" would still stream the mic to ElevenLabs, and the
+      // live toggle is hidden in Settings once local is on, so it could not
+      // even be turned back off.
+      if (!s.useLocalWhisper && s.liveTranscript && s.useScribe && s.hasElevenlabsKeys) {
+        try {
+          await startLiveRecording(s);
+          return;
+        } catch (e) {
+          // Socket refused (spent key, offline). Fall through to the batch
+          // recorder rather than failing the user's dictation outright.
+          stopStream();
+          stopAnalyser();
+        }
+      }
       // Live dictation needs the continuous VAD even if auto-stop is off.
       if (s.autoStop || s.liveDictation) await startVADRecording(s);
       else                               await startMediaRecording(s);
     } catch (err: any) {
+      // Both starters take the mic and open an AudioContext before their last
+      // fallible awaits, so a rejection here would otherwise leave the capture
+      // indicator lit and the rAF loop running for the life of the app. All
+      // three are idempotent.
+      stopStream();
+      stopAnalyser();
+      window.api.muteSystem(false);
       setError(err?.message ?? 'Mic error');
       setState('error');
       setTimeout(() => setState('idle'), 2500);
+    } finally {
+      startingRef.current = false;
     }
   }
 
   function stopRecording() {
-    if (micVADRef.current) stopVADRecording();
-    else                   stopMediaRecording();
+    if      (liveNodeRef.current) void stopLiveRecording();
+    else if (micVADRef.current)   stopVADRecording();
+    else                          stopMediaRecording();
   }
 
   function toggle() {
@@ -545,8 +699,12 @@ export function MicBar() {
   const noKey = !hasKey && state === 'idle';
   const isRec = state === 'recording';
 
+  // The bar is only ~210px wide, so the live preview shows as its tail — the
+  // words just spoken — rather than a truncated beginning that stops updating.
+  const livePreview = [liveDone, livePart].filter(Boolean).join(' ');
+  const liveTail = livePreview.length > 34 ? `…${livePreview.slice(-34)}` : livePreview;
+
   const stateLabel =
-    isRec                  ? 'Listening'    :
     state === 'processing' ? 'Processing'   :
     state === 'done'       ? 'Pasted'       :
     state === 'error'      ? (error || 'Error') :
@@ -593,8 +751,22 @@ export function MicBar() {
             </span>
           </span>
 
-          {/* Right side: label or waveform — only in logoText mode (or while recording) */}
-          {isRec ? (
+          {/* Right side: live caption, waveform, or label. The caption replaces
+              the waveform once the socket has produced text — the label element
+              below never mounts while recording, so it cannot carry it. Pinned
+              right inside a clipped box so the newest words stay on screen and
+              older ones slide off the left, the way captions read. */}
+          {isRec && showText && liveTail ? (
+            <div className="relative overflow-hidden" style={{ width: 130, height: 16 }}>
+              <span
+                className={`absolute right-0 top-0 whitespace-nowrap text-[12px] leading-4 font-medium select-none ${
+                  lightText ? 'text-zinc-700' : 'text-zinc-100'
+                }`}
+              >
+                {liveTail}
+              </span>
+            </div>
+          ) : isRec ? (
             <div className={`flex items-center ${showText ? 'px-0.5' : 'pl-1.5'}`} style={{ height: 16 }}>
               {/* Scrolling-history waveform (variant C) — icon left untouched. */}
               <canvas ref={canvasRef} style={{ width: 54, height: 16, display: 'block' }} />

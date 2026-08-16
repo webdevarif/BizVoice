@@ -353,6 +353,8 @@ fn default_settings() -> Value {
         // The user's own ElevenLabs keys, tried in order with failover.
         "elevenlabsKeys": [],
         "scribeMigratedV2": false,
+        // Stream to the realtime socket and show partials while speaking.
+        "liveTranscript": false,
         "customBaseUrl": "",
         "customChatModel": "",
         "customHeaders": "",
@@ -447,6 +449,135 @@ pub async fn test_elevenlabs_key(app: tauri::AppHandle, id: String) -> Result<Va
     }
 
     Ok(crate::pipeline::probe_elevenlabs_key(&key).await)
+}
+
+// ── Live transcription (Mode 1: preview) ────────────────────────────────────
+//
+// Holds the one in-flight realtime session. Only the mic bar starts these, and
+// only one recording runs at a time, so a single slot is enough; starting a new
+// session drops any previous one, which closes its socket.
+
+#[derive(Default)]
+pub struct LiveState(pub std::sync::Mutex<Option<crate::realtime::LiveSession>>);
+
+/// The merged settings object, unsanitized — callers here need the real keys.
+fn current_settings(app: &tauri::AppHandle) -> Value {
+    let mut s = default_settings();
+    if let Ok(store) = app.store(SETTINGS_STORE) {
+        if let Some(stored) = store.get(SETTINGS_KEY) {
+            merge_into(&mut s, &stored);
+        }
+    }
+    s
+}
+
+/// Open a live session. Fails loudly rather than silently falling back to the
+/// batch path: the caller decides whether to retry without live.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn live_start(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, LiveState>,
+    force_lang: Option<String>,
+) -> Result<(), String> {
+    let s = current_settings(&app);
+    let keys = decode_elevenlabs_keys(&s);
+    let lang = match force_lang {
+        Some(v) if !v.trim().is_empty() && v != "auto" => v,
+        _ => s
+            .get("inputLang")
+            .and_then(|v| v.as_str())
+            .unwrap_or("auto")
+            .to_string(),
+    };
+
+    let session = crate::realtime::start(app.clone(), keys, lang).await?;
+    if let Ok(mut slot) = state.0.lock() {
+        *slot = Some(session);
+    }
+    Ok(())
+}
+
+/// Feed one chunk of base64 16 kHz mono PCM16. Deliberately infallible from the
+/// UI's perspective — audio arriving after the socket died is dropped, and the
+/// error surfaces once, from live_stop.
+#[tauri::command(rename_all = "camelCase")]
+pub fn live_push(state: tauri::State<'_, LiveState>, chunk: String) {
+    use base64::Engine;
+    let Ok(pcm) = base64::engine::general_purpose::STANDARD.decode(chunk.as_bytes()) else {
+        return;
+    };
+    if let Ok(slot) = state.0.lock() {
+        if let Some(session) = slot.as_ref() {
+            session.push_audio(pcm);
+        }
+    }
+}
+
+/// Close the session and return the finished text, applying the same refine,
+/// dictionary and history steps the batch `transcribe` path does — so the
+/// caller still pastes exactly once, with output of the same shape.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn live_stop(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, LiveState>,
+    force_lang: Option<String>,
+    duration_ms: Option<i64>,
+) -> Result<String, String> {
+    let session = state.0.lock().ok().and_then(|mut slot| slot.take());
+    let Some(session) = session else {
+        return Ok(String::new()); // never started, or already stopped
+    };
+
+    // A `failure` alongside text means the socket died partway and this
+    // transcript is truncated. We still return it — losing it too would be
+    // worse — and the mic bar already knows: every path that records a failure
+    // emits `live:error` at the moment it happens, which is what stops the
+    // recording. Re-emitting here would only risk the duplicate landing inside
+    // a *later* session and cutting that one short.
+    let crate::realtime::LiveResult { text: raw, failure } = session.finish().await?;
+    #[cfg(debug_assertions)]
+    if let Some(err) = &failure {
+        eprintln!("[live] truncated transcript — session died: {err}");
+    }
+    let _ = failure;
+
+    if raw.is_empty() {
+        return Ok(String::new());
+    }
+
+    let s = current_settings(&app);
+    // Empty audio: build_opts only needs the non-audio fields for the refine
+    // step, since the transcript already exists.
+    let opts = build_opts(&s, &[], &app, false, force_lang.as_deref());
+
+    // Banglish always refines even with AI formatting off — the LLM is what
+    // romanizes the Bangla script (mirrors run_pipeline).
+    let text = if opts.skip_gpt && !opts.input_lang.eq_ignore_ascii_case("banglish") {
+        raw
+    } else {
+        crate::pipeline::gpt_refine(&opts, raw).await
+    };
+
+    let final_text = apply_dictionary(&text, &s);
+
+    if !final_text.is_empty() {
+        if let Some(token) = auth_token(&app) {
+            let words = final_text.split_whitespace().filter(|w| !w.is_empty()).count();
+            let dur = duration_ms.unwrap_or(0);
+            let base = api_base();
+            let body = json!({ "text": final_text, "words": words, "durationMs": dur });
+            tauri::async_runtime::spawn(async move {
+                let _ = reqwest::Client::new()
+                    .post(format!("{base}/api/bizvoice/history"))
+                    .bearer_auth(&token)
+                    .json(&body)
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await;
+            });
+        }
+    }
+    Ok(final_text)
 }
 
 /// One-time migration for the move to user-supplied ElevenLabs keys.

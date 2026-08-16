@@ -96,6 +96,15 @@ const api: Window['api'] = {
   // ── Appearance ──
   onAppearanceChange: (cb) => sub('appearance:changed', cb),
   onSettingsChange: (cb) => sub('settings:changed', cb),
+  onLivePartial: (cb) => sub('live:partial', cb),
+  onLiveCommitted: (cb) => sub('live:committed', cb),
+  onLiveError: (cb) => sub('live:error', cb),
+
+  // ── Live transcription (realtime STT) ──
+  liveStart: (inputLang?: string) => invoke('live_start', { forceLang: inputLang }),
+  livePush: (chunk: string) => invoke('live_push', { chunk }),
+  liveStop: (inputLang?: string, durationMs?: number) =>
+    invoke('live_stop', { forceLang: inputLang, durationMs }),
 
   // ── BizGrowHub auth + license ──
   startBrowserLogin: () => invoke('start_browser_login'),
@@ -187,6 +196,15 @@ declare global {
       onAppearanceChange: (cb: (data: { theme: string; widgetStyle: string }) => void) => () => void;
       /** Fired after any settings write, so non-focusable windows can re-read. */
       onSettingsChange: (cb: () => void) => () => void;
+      /** Realtime partial transcript — preview only, revised as the server refines it. */
+      onLivePartial: (cb: (text: string) => void) => () => void;
+      /** A phrase the server has finalised. Preview only; liveStop returns the paste text. */
+      onLiveCommitted: (cb: (text: string) => void) => () => void;
+      /** Terminal socket failure. The session is over — anything said after is lost. */
+      onLiveError: (cb: (message: string) => void) => () => void;
+      liveStart: (inputLang?: string) => Promise<void>;
+      livePush: (chunk: string) => Promise<void>;
+      liveStop: (inputLang?: string, durationMs?: number) => Promise<string>;
       startBrowserLogin: () => Promise<{ ok: boolean; error?: string }>;
       cancelBrowserLogin: () => Promise<{ ok: boolean }>;
       logout: () => Promise<{ ok: boolean }>;

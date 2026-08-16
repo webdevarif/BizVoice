@@ -141,6 +141,7 @@ export function Settings() {
   const [useBetterBangla, setUseBetterBangla] = useState(false);
   const [useScribe, setUseScribe] = useState(false);
   const [elKeys, setElKeys] = useState<ElKey[]>([]);
+  const [liveTranscript, setLiveTranscript] = useState(false);
   const [skipGpt, setSkipGpt] = useState(true); // AI Formatting off by default
   const [muteWhileRecording, setMuteWhileRecording] = useState(false);
   const [dictionary, setDictionary] = useState<DictEntry[]>([]);
@@ -227,6 +228,7 @@ export function Settings() {
       setUseBetterBangla(s.useBetterBangla ?? false);
       setUseScribe(s.useScribe ?? false);
       setElKeys(readElKeys(s));
+      setLiveTranscript(s.liveTranscript ?? false);
       setSkipGpt(s.skipGpt ?? true);
       setMuteWhileRecording(s.muteWhileRecording ?? false);
       setDictionary(s.dictionary || []);
@@ -731,6 +733,23 @@ export function Settings() {
                             onTest={() => testElKey(row.id)}
                           />
                         ))}
+
+                        <div className="flex items-center justify-between pt-1">
+                          <div className="pr-3">
+                            <Label>Live preview</Label>
+                            <HelpText>
+                              Shows words in the mic bar as you speak, instead of only after you stop. The text is still pasted once, at the end — formatting and Banglish work exactly as before. Uses more credits, since pauses are streamed too.
+                            </HelpText>
+                          </div>
+                          <Toggle
+                            on={liveTranscript}
+                            onClick={() => {
+                              const v = !liveTranscript;
+                              setLiveTranscript(v);
+                              save({ liveTranscript: v }, v ? 'Live preview on' : 'Live preview off');
+                            }}
+                          />
+                        </div>
 
                         <button
                           onClick={addElKey}
