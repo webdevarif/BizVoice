@@ -73,7 +73,6 @@ export default defineConfig({
       input: {
         micBar: resolve(__dirname, 'index.html'),
         settings: resolve(__dirname, 'settings.html'),
-        login: resolve(__dirname, 'login.html'),
         update: resolve(__dirname, 'update.html'),
         voiceEngine: resolve(__dirname, 'voiceEngine.html'),
       },

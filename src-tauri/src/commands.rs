@@ -150,20 +150,6 @@ fn obfuscate_keys(patch: &mut Value) {
     }
 }
 
-/// BizGrowHub backend base URL. Env override → dev localhost:8080 / prod prod host.
-fn api_base() -> String {
-    std::env::var("BIZGROWHUB_API")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| {
-            if cfg!(debug_assertions) {
-                "http://localhost:8080".into()
-            } else {
-                "https://bizgrowhub.shop".into()
-            }
-        })
-}
-
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -314,20 +300,6 @@ fn decode_key(settings: &Value, enc_field: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Persist a single field INSIDE the `settings` object (where every reader looks
-/// via `store.get(SETTINGS_KEY)`). The auth flow used to write the token as a
-/// TOP-LEVEL store key (`store.set("bizgrowhubTokenEncrypted", …)`), which no
-/// reader ever saw — so login never "stuck" and the app stayed logged-out.
-fn settings_merge(app: &tauri::AppHandle, key: &str, value: Value) {
-    let Ok(store) = app.store(SETTINGS_STORE) else { return };
-    let mut s = store.get(SETTINGS_KEY).unwrap_or_else(default_settings);
-    if let Some(obj) = s.as_object_mut() {
-        obj.insert(key.to_string(), value);
-    }
-    store.set(SETTINGS_KEY, s);
-    let _ = store.save();
-}
-
 /// Open the webview DevTools for the window the call came from (bound to F12 in
 /// the frontend). Available because the tauri `devtools` feature is enabled in
 /// Cargo.toml (so it works in release builds too, not just `tauri dev`).
@@ -389,11 +361,7 @@ fn default_settings() -> Value {
         "widgetStyle": "logoText",
         "instructions": "",
         "history": [],
-        "stats": { "recordings": 0, "words": 0, "durationMs": 0 },
-        "bizgrowhubTokenEncrypted": "",
-        "bizgrowhubEmail": "",
-        "bizgrowhubName": "",
-        "licenseOkAt": 0
+        "stats": { "recordings": 0, "words": 0, "durationMs": 0 }
     })
 }
 
@@ -561,21 +529,7 @@ pub async fn live_stop(
     let final_text = apply_dictionary(&text, &s);
 
     if !final_text.is_empty() {
-        if let Some(token) = auth_token(&app) {
-            let words = final_text.split_whitespace().filter(|w| !w.is_empty()).count();
-            let dur = duration_ms.unwrap_or(0);
-            let base = api_base();
-            let body = json!({ "text": final_text, "words": words, "durationMs": dur });
-            tauri::async_runtime::spawn(async move {
-                let _ = reqwest::Client::new()
-                    .post(format!("{base}/api/bizvoice/history"))
-                    .bearer_auth(&token)
-                    .json(&body)
-                    .timeout(std::time::Duration::from_secs(10))
-                    .send()
-                    .await;
-            });
-        }
+        record_history(&app, &final_text, duration_ms.unwrap_or(0) as i64);
     }
     Ok(final_text)
 }
@@ -719,101 +673,17 @@ pub fn focus_or_open_settings(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Reveal the mic bar if licensed, else surface the login window. Mirrors the
-/// tray click / "Show Mic Bar" handler in index.ts (`micBar ? show : openLogin`).
-pub fn show_micbar_or_login(app: &tauri::AppHandle) {
-    if local_license_ok(app) {
-        if let Some(w) = app.get_webview_window("micbar") {
-            let _ = w.show();
-            let _ = w.set_focus();
-            return;
-        }
-    }
-    show_login(app);
-}
-
-/// Show the login window (created hidden from tauri.conf.json).
-pub fn show_login(app: &tauri::AppHandle) {
-    if let Some(w) = app.get_webview_window("login") {
+/// Reveal and focus the mic bar (tray click / "Show Mic Bar").
+pub fn show_micbar(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("micbar") {
         let _ = w.show();
         let _ = w.set_focus();
     }
 }
 
-/// Fast, offline local license check used to pick the startup/tray window:
-/// a stored token plus a `licenseOkAt` inside the 7-day grace. The authoritative
-/// network re-check runs in `auth_status` (called by the frontend on mount).
-///
-/// As a fallback for users who signed in during an older build that never wrote
-/// `licenseOkAt`, we also peek into the stored JWT: if it has an `exp` claim and
-/// that claim lies in the future, the token itself is authoritative proof of a
-/// valid login — we treat it as locally licensed and immediately backfill
-/// `licenseOkAt` so subsequent boots don't re-decode the JWT.
-pub fn local_license_ok(app: &tauri::AppHandle) -> bool {
-    let Ok(store) = app.store(SETTINGS_STORE) else {
-        return false;
-    };
-    // Force a reload from disk on the first check (the plugin caches in mem
-    // between API calls but load() guarantees we read what was last saved).
-    let _ = store.reload();
-    let s = store.get(SETTINGS_KEY).unwrap_or_else(default_settings);
-    let has_token = !decode_key(&s, "bizgrowhubTokenEncrypted").is_empty();
-    let ok_at = s.get("licenseOkAt").and_then(|v| v.as_i64()).unwrap_or(0);
-    if !has_token {
-        return false;
-    }
-    if ok_at > 0 && (now_ms() - ok_at) < 7 * 24 * 60 * 60 * 1000 {
-        return true;
-    }
-    // Fallback: valid unexpired JWT → still good enough for local gating.
-    // Decode once, backfill ok_at so this branch is skipped on every next boot.
-    let token = decode_key(&s, "bizgrowhubTokenEncrypted");
-    if !token.is_empty() {
-        use base64::Engine;
-        let maybe_exp = token
-            .split('.')
-            .nth(1)
-            .and_then(|middle| {
-                let padded = match middle.len() % 4 {
-                    0 => middle.to_string(),
-                    2 => format!("{middle}=="),
-                    3 => format!("{middle}="),
-                    _ => middle.to_string(),
-                };
-                let url_standard: String = padded
-                    .chars()
-                    .map(|c| match c {
-                        '-' => '+',
-                        '_' => '/',
-                        other => other,
-                    })
-                    .collect();
-                base64::engine::general_purpose::STANDARD
-                    .decode(url_standard.as_bytes())
-                    .ok()
-            })
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .and_then(|claims| claims.get("exp").and_then(|v| v.as_i64()));
-        if let Some(exp_s) = maybe_exp {
-            let exp_ms = exp_s * 1000;
-            if exp_ms > now_ms() {
-                settings_merge(app, "licenseOkAt", json!(now_ms()));
-                return true;
-            }
-        }
-    }
-    has_token && ok_at > 0 && (now_ms() - ok_at) < 7 * 24 * 60 * 60 * 1000
-}
-
-/// Startup window gate (mirrors `app.whenReady` in index.ts): show the mic bar if
-/// locally licensed, otherwise the login window. The frontend's `authStatus()`
-/// call then does the authoritative network check and `on_licensed` if needed.
+/// Startup: the app needs no account, so the mic bar shows right away.
 pub fn startup_gate(app: &tauri::AppHandle) {
-    if local_license_ok(app) {
-        on_licensed(app);
-    } else {
-        show_login(app);
-    }
+    show_micbar(app);
 }
 
 #[tauri::command]
@@ -903,10 +773,7 @@ pub async fn transcribe(
         style_prompt,
         vocabulary: str_field("vocabulary", ""),
         use_scribe: s.get("useScribe").and_then(|v| v.as_bool()).unwrap_or(false),
-        use_better_bangla: s.get("useBetterBangla").and_then(|v| v.as_bool()).unwrap_or(false),
         elevenlabs_keys: decode_elevenlabs_keys(&s),
-        auth_token: decode_key(&s, "bizgrowhubTokenEncrypted"),
-        api_base: api_base(),
     };
 
     // Local whisper path: when enabled with a downloaded model, run STT via
@@ -948,24 +815,8 @@ pub async fn transcribe(
     };
     let final_text = apply_dictionary(&text, &s);
 
-    // Record to BizGrowHub history (fire-and-forget; offline = lost, acceptable
-    // for a dictation log). Mirrors recordTranscription in index.ts.
     if !final_text.is_empty() {
-        if let Some(token) = auth_token(&app) {
-            let words = final_text.split_whitespace().filter(|w| !w.is_empty()).count();
-            let dur = duration_ms.unwrap_or(0);
-            let base = api_base();
-            let body = json!({ "text": final_text, "words": words, "durationMs": dur });
-            tauri::async_runtime::spawn(async move {
-                let _ = reqwest::Client::new()
-                    .post(format!("{base}/api/bizvoice/history"))
-                    .bearer_auth(&token)
-                    .json(&body)
-                    .timeout(std::time::Duration::from_secs(10))
-                    .send()
-                    .await;
-            });
-        }
+        record_history(&app, &final_text, duration_ms.unwrap_or(0) as i64);
     }
     Ok(final_text)
 }
@@ -1125,7 +976,7 @@ pub fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                 ..
             } = event
             {
-                show_micbar_or_login(tray.app_handle());
+                show_micbar(tray.app_handle());
             }
         });
     if let Some(icon) = app.default_window_icon().cloned() {
@@ -1140,7 +991,7 @@ pub fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 /// and the tray's own `on_menu_event`.
 pub fn handle_menu(app: &tauri::AppHandle, id: &str) {
     match id {
-        "show_micbar" => show_micbar_or_login(app),
+        "show_micbar" => show_micbar(app),
         "settings" | "ctx_settings" => {
             let _ = focus_or_open_settings(app);
         }
@@ -1161,49 +1012,56 @@ pub fn handle_menu(app: &tauri::AppHandle, id: &str) {
 // History & stats (Phase 2)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The stored BizGrowHub bearer token, if signed in.
-fn auth_token(app: &tauri::AppHandle) -> Option<String> {
-    let store = app.store(SETTINGS_STORE).ok()?;
-    let s = store.get(SETTINGS_KEY).unwrap_or_else(default_settings);
-    let token = decode_key(&s, "bizgrowhubTokenEncrypted");
-    (!token.is_empty()).then_some(token)
+const HISTORY_STORE: &str = "history.json";
+const HISTORY_LIMIT: usize = 500;
+
+/// Append one dictation to the local history and bump the running stats.
+/// Everything stays on this PC; there is no backend.
+fn record_history(app: &tauri::AppHandle, text: &str, duration_ms: i64) {
+    let Ok(store) = app.store(HISTORY_STORE) else {
+        return;
+    };
+    let words = text.split_whitespace().count() as i64;
+    let mut list = store
+        .get("history")
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    list.insert(
+        0,
+        json!({ "ts": now_ms(), "text": text, "words": words, "durationMs": duration_ms }),
+    );
+    list.truncate(HISTORY_LIMIT);
+    store.set("history", Value::Array(list));
+
+    let stats = store.get("stats").unwrap_or_else(|| json!({}));
+    let get = |k: &str| stats.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+    store.set(
+        "stats",
+        json!({
+            "recordings": get("recordings") + 1,
+            "words": get("words") + words,
+            "durationMs": get("durationMs") + duration_ms.max(0),
+        }),
+    );
+    let _ = store.save();
 }
 
-/// Dictation history (last 200) from BizGrowHub. Mirrors `history:get` in
-/// index.ts — entries live in the backend, not locally. Empty list when signed
-/// out or offline.
+/// Dictation history, newest first, read from the local history store.
 #[tauri::command]
 pub async fn get_history(app: tauri::AppHandle) -> Value {
-    let Some(token) = auth_token(&app) else {
-        return json!([]);
-    };
-    let resp = reqwest::Client::new()
-        .get(format!("{}/api/bizvoice/history?limit=200", api_base()))
-        .bearer_auth(&token)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await;
-    match resp {
-        Ok(r) if r.status().is_success() => {
-            let data: Value = r.json().await.unwrap_or_else(|_| json!({}));
-            data.get("history").cloned().unwrap_or_else(|| json!([]))
-        }
-        _ => json!([]),
-    }
+    app.store(HISTORY_STORE)
+        .ok()
+        .and_then(|s| s.get("history"))
+        .unwrap_or_else(|| json!([]))
 }
 
 #[tauri::command]
 pub async fn clear_history(app: tauri::AppHandle) -> Result<(), String> {
-    // Clear the backend history (best-effort) AND the local refined-correction
-    // cache, mirroring electron/main/index.ts:851-854.
-    if let Some(token) = auth_token(&app) {
-        let _ = reqwest::Client::new()
-            .delete(format!("{}/api/bizvoice/history", api_base()))
-            .bearer_auth(&token)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await;
-    }
+    // Clear the history list (stats are lifetime totals and stay) and the
+    // refined-correction cache.
+    let hist = app.store(HISTORY_STORE).map_err(|e| e.to_string())?;
+    hist.set("history", json!([]));
+    hist.save().map_err(|e| e.to_string())?;
     let store = app.store(SETTINGS_STORE).map_err(|e| e.to_string())?;
     store.set(REFINED_CACHE_KEY, json!({}));
     store.save().map_err(|e| e.to_string())?;
@@ -1361,20 +1219,10 @@ pub fn get_refined_cache(app: tauri::AppHandle) -> Result<Value, String> {
 
 #[tauri::command]
 pub async fn get_stats(app: tauri::AppHandle) -> Value {
-    let default = json!({ "recordings": 0, "words": 0, "durationMs": 0 });
-    let Some(token) = auth_token(&app) else {
-        return default;
-    };
-    let resp = reqwest::Client::new()
-        .get(format!("{}/api/bizvoice/stats", api_base()))
-        .bearer_auth(&token)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await;
-    match resp {
-        Ok(r) if r.status().is_success() => r.json().await.unwrap_or(default),
-        _ => default,
-    }
+    app.store(HISTORY_STORE)
+        .ok()
+        .and_then(|s| s.get("stats"))
+        .unwrap_or_else(|| json!({ "recordings": 0, "words": 0, "durationMs": 0 }))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1489,396 +1337,6 @@ pub fn whisper_delete_model(app: tauri::AppHandle, name: String) -> bool {
     };
     let p = dir.join(file);
     p.exists() && std::fs::remove_file(&p).is_ok()
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// BizGrowHub auth + license (Phase 5)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Browser-based sign-in: spin up a one-shot loopback HTTP server on
-/// 127.0.0.1:0, open the BizGrowHub desktop-auth page, and accept the JWT it
-/// hands back to /callback. Mirrors index.ts startBrowserLogin.
-#[tauri::command]
-pub fn start_browser_login(app: tauri::AppHandle) -> Result<Value, String> {
-    use std::io::{Read, Write};
-    use tauri::Emitter;
-    use tauri_plugin_opener::OpenerExt;
-
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| format!("could not start local sign-in server: {e}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| e.to_string())?
-        .port();
-    // CSRF state. TODO: replace with a CSPRNG; sufficient for a localhost one-shot.
-    let state = format!("{:x}{:x}", now_ms(), std::process::id());
-
-    let url = format!("{}/desktop-auth?port={}&state={}", api_base(), port, state);
-    app.opener()
-        .open_url(url, None::<&str>)
-        .map_err(|e| e.to_string())?;
-
-    let app2 = app.clone();
-    std::thread::spawn(move || {
-        let expected_state = state;
-        // Accept up to ~10 incoming attempts before giving up. Handles the
-        // common case where:
-        //   • browser sends GET /favicon.ico before the real /callback redirect,
-        //   • CORS preflight OPTIONS request lands ahead of the real payload,
-        //   • user refreshes the success page and triggers a second GET.
-        for _ in 0..10 {
-            let Ok((mut stream, _)) = listener.accept() else {
-                break;
-            };
-            let mut buf = [0u8; 16384];
-            let n = stream.read(&mut buf).unwrap_or(0);
-            if n == 0 {
-                continue;
-            }
-            let req = String::from_utf8_lossy(&buf[..n]);
-            let method = req.lines().next().unwrap_or("").split_whitespace().next().unwrap_or("");
-            let path = req
-                .lines()
-                .next()
-                .unwrap_or("")
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or("");
-
-            // Silently short-circuit favicon / static probes that browsers
-            // fire automatically — they shouldn't consume the callback.
-            if path.starts_with("/favicon") || path == "/robots.txt" {
-                let _ = stream.write_all(
-                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                );
-                continue;
-            }
-
-            // CORS preflight: modern browsers send OPTIONS before an XHR/fetch
-            // from HTTPS bizgrowhub.shop → HTTP localhost. Without Access-Control
-            // headers the subsequent real callback is BLOCKED by the browser.
-            if method == "OPTIONS" {
-                let _ = stream.write_all(
-                    b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                );
-                continue;
-            }
-
-            let (token, st) = parse_callback(path);
-            let ok = !token.is_empty() && st == expected_state;
-
-            // Always include permissive CORS headers on the response too, so
-            // even if the page uses XHR/fetch (not top-level navigate) the
-            // browser can read the success body.
-            let cors = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Credentials: true\r\n";
-
-            let body = if ok {
-                "<h2>BizVoice connected \u{2713}</h2><p>You can close this tab and return to the app.</p>"
-            } else if !token.is_empty() {
-                "<h2>Invalid sign-in</h2><p>State mismatch — please retry from the BizVoice app.</p>"
-            } else {
-                // Waiting page — probably just favicon / preflight noise
-                // that slipped past, so keep the listener alive for another
-                // attempt instead of surfacing a scary error.
-                "<h2>Waiting for sign-in…</h2><p>If this page stays open, go back to BizVoice and click Sign In again.</p>"
-            };
-            let html = format!(
-                "<!doctype html><html><body style=\"font-family:system-ui;background:#0A0A0F;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0\"><div style=\"text-align:center\">{body}</div></body></html>"
-            );
-            let status = if ok {
-                "HTTP/1.1 200 OK"
-            } else if !token.is_empty() {
-                "HTTP/1.1 403 Forbidden"
-            } else {
-                "HTTP/1.1 200 OK"
-            };
-            let resp = format!(
-                "{status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len}\r\n{cors}Connection: close\r\n\r\n{html}",
-                len = html.len(),
-                cors = cors,
-                status = status,
-                html = html,
-            );
-            let _ = stream.write_all(resp.as_bytes());
-            let _ = stream.flush();
-            drop(stream);
-
-            if ok {
-                // ── FIX A: persist token + license grace + email in ONE step.
-                // Previously we only saved the token here and relied on a
-                // successful `auth_status()` network call to backfill
-                // `licenseOkAt`.  If that call timed out or the user restarted
-                // the app *before* it ran, `local_license_ok` would return
-                // false on next boot and force the user through login again
-                // even though the token is perfectly valid.
-                let (email, name) = decode_jwt_claims(&token);
-                {
-                    use base64::Engine;
-                    let enc = base64::engine::general_purpose::STANDARD.encode(token.as_bytes());
-                    settings_merge(&app2, "bizgrowhubTokenEncrypted", json!(enc));
-                }
-                // The token was just minted by BizGrowHub → treat the current
-                // millisecond as the start of the 7-day offline grace window.
-                settings_merge(&app2, "licenseOkAt", json!(now_ms()));
-                if !email.is_empty() {
-                    settings_merge(&app2, "bizgrowhubEmail", json!(email));
-                }
-                if !name.is_empty() {
-                    settings_merge(&app2, "bizgrowhubName", json!(name));
-                }
-
-                let _ = app2.emit(
-                    "auth:changed",
-                    json!({ "active": true, "loggedIn": true, "email": email, "name": name }),
-                );
-                on_licensed(&app2);
-                break;
-            }
-            // state mismatch with a token = abort, don't accept more attempts.
-            if !token.is_empty() {
-                break;
-            }
-        }
-    });
-
-    Ok(json!({ "ok": true }))
-}
-
-/// Pull email + display name out of the middle base64url payload of a JWT.
-/// Returns ("", "") on any parse failure (callers fall back to "Signed in" + ?).
-fn decode_jwt_claims(token: &str) -> (String, String) {
-    use base64::Engine;
-    let middle = match token.split('.').nth(1) {
-        Some(m) => m,
-        None => return (String::new(), String::new()),
-    };
-    // JWT payloads use base64url (-_), not standard (+/). Pad to a multiple of
-    // 4 bytes so the decoder doesn't reject short payloads.
-    let padded = match middle.len() % 4 {
-        0 => middle.to_string(),
-        2 => format!("{middle}=="),
-        3 => format!("{middle}="),
-        _ => middle.to_string(),
-    };
-    let url_standard: String = padded.chars().map(|c| match c {
-        '-' => '+',
-        '_' => '/',
-        other => other,
-    }).collect();
-    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(url_standard.as_bytes()) else {
-        return (String::new(), String::new());
-    };
-    let Ok(json) = serde_json::from_slice::<Value>(&bytes) else {
-        return (String::new(), String::new());
-    };
-    let email = json
-        .get("email")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    // Common claim names for display name (in order of BizGrowHub likelihood).
-    let name = json
-        .get("name")
-        .and_then(|v| v.as_str())
-        .or_else(|| json.get("displayName").and_then(|v| v.as_str()))
-        .or_else(|| json.get("full_name").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .to_string();
-    (email, name)
-}
-
-/// Parse `token` and `state` from a `/callback?token=..&state=..` path.
-fn parse_callback(path: &str) -> (String, String) {
-    let (mut token, mut state) = (String::new(), String::new());
-    if let Some(q) = path.split('?').nth(1) {
-        for pair in q.split('&') {
-            let mut it = pair.splitn(2, '=');
-            match (it.next(), it.next()) {
-                (Some("token"), Some(v)) => token = urldecode(v),
-                (Some("state"), Some(v)) => state = urldecode(v),
-                _ => {}
-            }
-        }
-    }
-    (token, state)
-}
-
-/// Minimal percent-decoding for query params.
-fn urldecode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                Ok(b) => {
-                    out.push(b);
-                    i += 3;
-                }
-                Err(_) => {
-                    out.push(bytes[i]);
-                    i += 1;
-                }
-            },
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-#[tauri::command]
-pub fn cancel_browser_login() -> Value {
-    json!({ "ok": true })
-}
-
-#[tauri::command]
-pub fn logout(app: tauri::AppHandle) -> Result<Value, String> {
-    settings_merge(&app, "bizgrowhubTokenEncrypted", json!(""));
-    settings_merge(&app, "licenseOkAt", json!(0));
-    settings_merge(&app, "bizgrowhubEmail", json!(""));
-    settings_merge(&app, "bizgrowhubName", json!(""));
-    if let Some(w) = app.get_webview_window("micbar") {
-        let _ = w.hide();
-    }
-    use tauri::Emitter;
-    let _ = app.emit(
-        "auth:changed",
-        json!({ "active": false, "loggedIn": false, "email": "", "name": "" }),
-    );
-    show_login(&app);
-    Ok(json!({ "ok": true }))
-}
-
-/// User is authenticated AND licensed — reveal the mic bar and dismiss the login
-/// window. Mirrors `onLicensed()` in index.ts (the remote-settings pull is the
-/// frontend's responsibility under Tauri; hotkeys are registered at startup).
-pub fn on_licensed(app: &tauri::AppHandle) {
-    if let Some(w) = app.get_webview_window("micbar") {
-        let _ = w.show();
-    }
-    if let Some(w) = app.get_webview_window("login") {
-        let _ = w.hide();
-    }
-}
-
-/// License/auth status — GET /api/bizvoice/license with the stored token, with a
-/// 7-day offline grace (mirrors index.ts checkLicense).
-#[tauri::command]
-pub async fn auth_status(app: tauri::AppHandle) -> Result<Value, String> {
-    let store = app.store(SETTINGS_STORE).map_err(|e| e.to_string())?;
-    let s = store.get(SETTINGS_KEY).unwrap_or_else(default_settings);
-    let token = decode_key(&s, "bizgrowhubTokenEncrypted");
-    if token.is_empty() {
-        return Ok(json!({ "loggedIn": false, "active": false, "email": "", "name": "" }));
-    }
-
-    // ── Back-compat fill: users who signed in before the JWT-claim decode
-    //    change landed have bizgrowhubEmail == "" even though their token
-    //    contains the email.  Pull email/name out of the stored JWT once and
-    //    persist so the UI shows them without a network round-trip.
-    let stored_email = s
-        .get("bizgrowhubEmail")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let stored_name = s
-        .get("bizgrowhubName")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let (jwt_email, jwt_name) = decode_jwt_claims(&token);
-    let mut email = stored_email.clone();
-    let mut name = stored_name.clone();
-    if email.is_empty() && !jwt_email.is_empty() {
-        email = jwt_email.clone();
-        settings_merge(&app, "bizgrowhubEmail", json!(jwt_email));
-    }
-    if name.is_empty() && !jwt_name.is_empty() {
-        name = jwt_name.clone();
-        settings_merge(&app, "bizgrowhubName", json!(jwt_name));
-    }
-
-    let resp = reqwest::Client::new()
-        .get(format!("{}/api/bizvoice/license", api_base()))
-        .bearer_auth(&token)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await;
-    match resp {
-        Ok(r) if r.status().as_u16() == 401 => {
-            settings_merge(&app, "bizgrowhubTokenEncrypted", json!(""));
-            settings_merge(&app, "licenseOkAt", json!(0));
-            settings_merge(&app, "bizgrowhubEmail", json!(""));
-            settings_merge(&app, "bizgrowhubName", json!(""));
-            if let Some(w) = app.get_webview_window("micbar") {
-                let _ = w.hide();
-            }
-            {
-                use tauri::Emitter;
-                let _ = app.emit(
-                    "auth:changed",
-                    json!({ "active": false, "loggedIn": false, "email": "", "name": "" }),
-                );
-            }
-            show_login(&app);
-            Ok(json!({ "loggedIn": false, "active": false, "email": "", "name": "" }))
-        }
-        Ok(r) if r.status().is_success() => {
-            let data: Value = r.json().await.unwrap_or_else(|_| json!({}));
-            let active = data.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
-            // If the license endpoint sends us fresher profile info
-            // (email/name) than what we cached from the JWT, prefer it.
-            if let Some(v) = data.get("email").and_then(|v| v.as_str()) {
-                if !v.is_empty() && v != email.as_str() {
-                    email = v.to_string();
-                    settings_merge(&app, "bizgrowhubEmail", json!(email));
-                }
-            }
-            if let Some(v) = data.get("name").and_then(|v| v.as_str()) {
-                if !v.is_empty() && v != name.as_str() {
-                    name = v.to_string();
-                    settings_merge(&app, "bizgrowhubName", json!(name));
-                }
-            }
-            if active {
-                settings_merge(&app, "licenseOkAt", json!(now_ms()));
-                on_licensed(&app);
-            }
-            Ok(json!({ "loggedIn": true, "active": active, "email": email, "name": name }))
-        }
-        _ => {
-            // Offline grace: trust the last successful check for 7 days.
-            let ok_at = s.get("licenseOkAt").and_then(|v| v.as_i64()).unwrap_or(0);
-            let active = ok_at > 0 && (now_ms() - ok_at) < 7 * 24 * 60 * 60 * 1000;
-            if active {
-                on_licensed(&app);
-            }
-            Ok(json!({ "loggedIn": true, "active": active, "email": email, "name": name, "offline": true }))
-        }
-    }
-}
-
-#[tauri::command]
-pub fn open_subscribe(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri_plugin_opener::OpenerExt;
-    app.opener()
-        .open_url(format!("{}/marketplace", api_base()), None::<&str>)
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn open_register(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri_plugin_opener::OpenerExt;
-    app.opener()
-        .open_url(format!("{}/register", api_base()), None::<&str>)
-        .map_err(|e| e.to_string())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2020,8 +1478,8 @@ pub fn update_later(window: Window) {
 //
 // Tier 1 (LIVE PARTIAL, blue text):
 //   Every ~2s of accumulated audio, run the FASTEST available STT engine
-//   (Groq / Local Whisper / OpenAI fallback). Scribe and ImprovedBangla are
-//   explicitly SKIPPED here because their batch BizGrowHub proxies have 10-60s
+//   (Groq / Local Whisper / OpenAI fallback). Scribe is
+//   explicitly SKIPPED here because their batch requests have 10-60s
 //   latency. No GPT refine — raw STT is fine for a live tentative preview.
 //   → emits `transcript:partial`
 //
@@ -2217,14 +1675,11 @@ fn build_opts(
         str_field("gptModel", "gpt-4o-mini")
     };
 
-    let (use_scribe, use_better_bangla, skip_gpt) = if force_fast_partial_mode {
-        (false, false, true)
+    let (use_scribe, skip_gpt) = if force_fast_partial_mode {
+        (false, true)
     } else {
         (
             s.get("useScribe").and_then(|v| v.as_bool()).unwrap_or(false),
-            s.get("useBetterBangla")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
             s.get("skipGpt").and_then(|v| v.as_bool()).unwrap_or(true),
         )
     };
@@ -2265,15 +1720,12 @@ fn build_opts(
         style_prompt,
         vocabulary,
         use_scribe,
-        use_better_bangla,
         // Empty in fast-partial mode, where use_scribe is forced off anyway.
         elevenlabs_keys: if use_scribe {
             decode_elevenlabs_keys(s)
         } else {
             Vec::new()
         },
-        auth_token: decode_key(s, "bizgrowhubTokenEncrypted"),
-        api_base: api_base(),
     }
 }
 

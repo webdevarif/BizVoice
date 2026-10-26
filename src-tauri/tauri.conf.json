@@ -12,17 +12,6 @@
   "app": {
     "windows": [
       {
-        "label": "login",
-        "url": "login.html",
-        "title": "BizVoice",
-        "width": 720,
-        "height": 560,
-        "decorations": false,
-        "resizable": false,
-        "center": true,
-        "visible": false
-      },
-      {
         "label": "settings",
         "url": "settings.html",
         "title": "BizVoice — Settings",
