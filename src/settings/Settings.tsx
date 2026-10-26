@@ -138,7 +138,6 @@ export function Settings() {
   const [customBaseUrl, setCustomBaseUrl] = useState('');
   const [customChatModel, setCustomChatModel] = useState('');
   const [customHeaders, setCustomHeaders] = useState('');
-  const [useBetterBangla, setUseBetterBangla] = useState(false);
   const [useScribe, setUseScribe] = useState(false);
   const [elKeys, setElKeys] = useState<ElKey[]>([]);
   const [liveTranscript, setLiveTranscript] = useState(false);
@@ -158,7 +157,6 @@ export function Settings() {
   const [newTerm, setNewTerm] = useState({ from: '', to: '', category: '' });
   const [editingDict, setEditingDict] = useState<number | null>(null);
   const [toast, setToast] = useState<{ kind: 'ok' | 'err'; msg: string } | null>(null);
-  const [auth, setAuth] = useState<{ loggedIn: boolean; active: boolean; email: string; offline?: boolean }>({ loggedIn: false, active: false, email: '' });
   const [upd, setUpd] = useState<{ current: string; latest: { version: string; notes?: string[]; releasedAt?: string } | null; updateAvailable: boolean; downloaded: boolean } | null>(null);
   const [checking, setChecking] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -178,13 +176,6 @@ export function Settings() {
     const loop = (time: number) => { lenis.raf(time); raf = requestAnimationFrame(loop); };
     raf = requestAnimationFrame(loop);
     return () => { cancelAnimationFrame(raf); lenis.destroy(); };
-  }, []);
-
-  // Logged-in user shown in the sidebar footer
-  useEffect(() => {
-    window.api.authStatus().then(setAuth).catch(() => {});
-    const off = window.api.onAuthChange((d) => setAuth((p) => ({ ...p, ...d })));
-    return off;
   }, []);
 
   // App version + live update check (About tab).
@@ -225,7 +216,6 @@ export function Settings() {
       if (s.hasOpenrouterKey) setOpenrouterKey('••••••••••••••••••••');
       setHasCustomKey(!!s.hasCustomKey);
       if (s.hasCustomKey) setCustomKey('••••••••••••••••••••');
-      setUseBetterBangla(s.useBetterBangla ?? false);
       setUseScribe(s.useScribe ?? false);
       setElKeys(readElKeys(s));
       setLiveTranscript(s.liveTranscript ?? false);
@@ -518,10 +508,8 @@ export function Settings() {
 
   // "Active pipeline" status — mirrors the Rust STT-selection priority so the
   // user can always see which model will actually run for the current settings.
-  const langIsBangla = /^(bangla|banglish|bn)$/i.test(inputLang);
   const activeStt =
     useScribe ? 'ElevenLabs Scribe (premium)'
-    : (useBetterBangla && langIsBangla) ? 'Improved Bangla (BanglaASR)'
     : useLocalWhisper ? `Local Whisper (${localModel})`
     : sttProvider === 'groq' ? 'Groq · whisper-large-v3'
     : `OpenAI · ${sttModel}`;
@@ -546,33 +534,6 @@ export function Settings() {
             ))}
           </div>
 
-          {/* Logged-in user */}
-          <div className="border-t border-white/5 p-2.5">
-            {auth.loggedIn ? (
-              <div className="flex items-center gap-2.5 px-1">
-                <div className="w-8 h-8 rounded-full bg-blue-600/30 text-blue-300 flex items-center justify-center text-xs font-bold uppercase shrink-0">
-                  {auth.email ? auth.email[0] : '?'}
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="text-xs font-medium text-white truncate" title={auth.email}>{auth.email || 'Signed in'}</div>
-                  <div className="flex items-center gap-1 text-[10px] text-white/40">
-                    <span className={`w-1.5 h-1.5 rounded-full ${auth.offline ? 'bg-amber-500' : auth.active ? 'bg-green-500' : 'bg-white/30'}`} />
-                    {auth.offline ? 'Offline' : auth.active ? 'Active' : 'Inactive'}
-                  </div>
-                </div>
-                <button onClick={() => window.api.logout()} title="Log out"
-                  className="text-white/40 hover:text-red-400 p-1 rounded hover:bg-white/5 transition-colors shrink-0">
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-                </button>
-              </div>
-            ) : (
-              <button onClick={() => window.api.startBrowserLogin()}
-                className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-md text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white transition-colors">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
-                Sign in
-              </button>
-            )}
-          </div>
         </div>
 
         {/* Content */}
@@ -1017,26 +978,6 @@ export function Settings() {
                 <Label>Custom Vocabulary</Label>
                 <HelpText>Comma-separated terms (names, jargon) for better recognition.</HelpText>
                 <textarea value={vocabulary} onChange={(e) => setVocabulary(e.target.value)} onBlur={() => save({ vocabulary }, 'Vocabulary saved')} rows={2} placeholder="React, Next.js, Supabase, Prisma" className={inputCls + ' font-mono text-[11px] resize-none'} />
-              </Card>
-
-              {/* Better Bangla — routes Bangla audio through a server-side
-                  ASR model on BizGrowHub. No additional account or token
-                  needed; works with the same login users already have. */}
-              <Card>
-                <div className="flex items-center justify-between">
-                  <div>
-                    <Label>Improved Bangla transcription</Label>
-                    <HelpText>
-                      Routes Bangla audio through a Bangla-tuned ASR model on the BizGrowHub backend. No extra token needed — works with your existing login. Far more accurate than default Whisper for Bangla.
-                    </HelpText>
-                  </div>
-                  <Toggle on={useBetterBangla} onClick={() => { const v = !useBetterBangla; setUseBetterBangla(v); save({ useBetterBangla: v }, v ? 'Improved Bangla enabled' : 'Default Bangla'); }} />
-                </div>
-                {useBetterBangla && (
-                  <div className="text-[11px] text-white/40 mt-2">
-                    Bangla dictation will route to the BizGrowHub Bangla model. Other languages keep using your selected provider above. First request may take 10–30s (cold start); subsequent ones are fast.
-                  </div>
-                )}
               </Card>
 
             </Section>

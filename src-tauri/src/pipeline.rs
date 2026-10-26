@@ -1,7 +1,7 @@
 // Phase 4: cloud transcription pipeline — ported from electron/main/pipeline.ts.
 //
 // First cut: OpenAI / Groq Whisper STT (multipart) + OpenAI-compatible GPT
-// refine (chat/completions). Custom provider, BizGrowHub-Bangla proxy, and
+// refine (chat/completions). Custom provider and
 // local whisper (whisper-rs) are layered on next. All providers are
 // OpenAI-compatible HTTP, so a single reqwest path parametrised by base URL +
 // key + model covers OpenAI, Groq, and custom.
@@ -29,9 +29,6 @@ pub struct PipelineOpts {
     /// The user's ElevenLabs keys as (label, key), tried in order. More than one
     /// lets dictation survive an account running out of credits mid-session.
     pub elevenlabs_keys: Vec<(String, String)>,
-    pub use_better_bangla: bool, // route Bangla through BizGrowHub's tuned ASR
-    pub auth_token: String,      // BizGrowHub JWT (auth for the Bangla proxy)
-    pub api_base: String,        // BizGrowHub base URL (e.g. https://bizgrowhub.shop)
 }
 
 /// Subset of pipeline.ts LANG_TO_ISO (app label → ISO-639-1). Returns None for
@@ -84,28 +81,6 @@ pub async fn run_pipeline(opts: PipelineOpts) -> Result<String, String> {
         let raw = raw.trim().to_string();
         #[cfg(debug_assertions)]
         eprintln!("[stt] scribe raw = {raw:?}");
-        if raw.is_empty() {
-            return Ok(String::new());
-        }
-        // Banglish needs the LLM to romanize, so it always refines even when
-        // "AI Formatting" is off — otherwise you'd get raw Bangla script.
-        if opts.skip_gpt && !opts.input_lang.eq_ignore_ascii_case("banglish") {
-            return Ok(raw);
-        }
-        return Ok(gpt_refine(&opts, raw).await);
-    }
-
-    // ── Improved Bangla transcription ──────────────────────────────────────
-    // When the user enables it AND is speaking Bangla AND is signed in, route
-    // the audio through BizGrowHub's Bangla-tuned ASR (HF BanglaASR) using their
-    // login token — far more accurate than Whisper for Bangla. No fallback to
-    // Whisper on error: the user explicitly chose this model, so we surface the
-    // failure instead of silently returning the garbled Whisper output.
-    if opts.use_better_bangla && iso.as_deref() == Some("bn") && !opts.auth_token.is_empty() {
-        let raw = better_bangla_stt(&client, &opts, &bytes).await?;
-        let raw = raw.trim().to_string();
-        #[cfg(debug_assertions)]
-        eprintln!("[stt] better-bangla raw = {raw:?}");
         if raw.is_empty() {
             return Ok(String::new());
         }
@@ -182,54 +157,6 @@ pub async fn run_pipeline(opts: PipelineOpts) -> Result<String, String> {
         return Ok(raw);
     }
     Ok(gpt_refine(&opts, raw).await)
-}
-
-/// Transcribe Bangla audio via BizGrowHub's tuned ASR proxy
-/// (POST /api/bizvoice/transcribe-indic, authed with the user's JWT). Returns the
-/// raw transcript text, or a user-facing error on failure / cold-start.
-async fn better_bangla_stt(
-    client: &reqwest::Client,
-    opts: &PipelineOpts,
-    audio: &[u8],
-) -> Result<String, String> {
-    let url = format!(
-        "{}/api/bizvoice/transcribe-indic",
-        opts.api_base.trim_end_matches('/')
-    );
-    let part = reqwest::multipart::Part::bytes(audio.to_vec())
-        .file_name("audio.wav")
-        .mime_str("audio/wav")
-        .map_err(|e| e.to_string())?;
-    let form = reqwest::multipart::Form::new()
-        .text("language", "bangla")
-        .part("file", part);
-
-    let resp = client
-        .post(&url)
-        .bearer_auth(&opts.auth_token)
-        .multipart(form)
-        .timeout(Duration::from_secs(60))
-        .send()
-        .await
-        .map_err(|e| format!("Bangla STT request failed: {e}"))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        // 503 = HF model cold-start; guide the user to retry rather than dump the body.
-        if status.as_u16() == 503 {
-            return Err("Bangla model is warming up — please try again in a few seconds.".into());
-        }
-        let body = resp.text().await.unwrap_or_default();
-        let snippet: String = body.chars().take(200).collect();
-        return Err(format!("Bangla STT failed ({status}): {snippet}"));
-    }
-
-    let data: Value = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(data
-        .get("transcript")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string())
 }
 
 // ── ElevenLabs Scribe (direct, multi-key) ───────────────────────────────────

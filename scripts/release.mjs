@@ -8,7 +8,7 @@
 //
 // What it does: before running the pipeline, if GH_TOKEN isn't in process.env,
 // read it directly from the User-level registry via PowerShell and inject it.
-// Then run version bump → vite build → electron-builder → bizgrowhub publish.
+// Then run version bump → vite build → electron-builder.
 // Any failure aborts with a clear error.
 
 import { execSync, spawnSync } from 'node:child_process';
@@ -65,6 +65,5 @@ if (!process.env.GH_TOKEN) {
 run('npm', ['version', 'patch', '--no-git-tag-version']);
 run('npx', ['vite', 'build']);
 run('npx', ['electron-builder', '--publish', 'always']);
-run('node', ['scripts/publish-to-bizgrowhub.mjs']);
 
 log('Release pipeline completed successfully.');

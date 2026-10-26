@@ -186,7 +186,7 @@ pub fn run() {
             commands::build_tray(app.handle())?;
             // Keep the transparent mic-bar overlay pinned topmost + non-activating.
             overlay::start_micbar_pin(app.handle());
-            // Gate startup: show the mic bar if locally licensed, else login.
+            // Startup: show the mic bar (no account needed).
             commands::startup_gate(app.handle());
             Ok(())
         })
@@ -224,13 +224,6 @@ pub fn run() {
             commands::whisper_list_models,
             commands::whisper_download_model,
             commands::whisper_delete_model,
-            // Auth + license (Phase 5)
-            commands::start_browser_login,
-            commands::cancel_browser_login,
-            commands::logout,
-            commands::auth_status,
-            commands::open_subscribe,
-            commands::open_register,
             // App updates (Phase 5)
             commands::update_info,
             commands::update_download,

@@ -106,14 +106,6 @@ const api: Window['api'] = {
   liveStop: (inputLang?: string, durationMs?: number) =>
     invoke('live_stop', { forceLang: inputLang, durationMs }),
 
-  // ── BizGrowHub auth + license ──
-  startBrowserLogin: () => invoke('start_browser_login'),
-  cancelBrowserLogin: () => invoke('cancel_browser_login'),
-  logout: () => invoke('logout'),
-  authStatus: () => invoke('auth_status'),
-  openSubscribe: () => invoke('open_subscribe'),
-  openRegister: () => invoke('open_register'),
-  onAuthChange: (cb) => sub('auth:changed', cb),
 
   // ── App updates ──
   updateInfo: (forceCheck?: boolean) => invoke('update_info', { forceCheck: forceCheck ?? false }),
@@ -205,13 +197,6 @@ declare global {
       liveStart: (inputLang?: string) => Promise<void>;
       livePush: (chunk: string) => Promise<void>;
       liveStop: (inputLang?: string, durationMs?: number) => Promise<string>;
-      startBrowserLogin: () => Promise<{ ok: boolean; error?: string }>;
-      cancelBrowserLogin: () => Promise<{ ok: boolean }>;
-      logout: () => Promise<{ ok: boolean }>;
-      authStatus: () => Promise<{ loggedIn: boolean; active: boolean; email: string; offline?: boolean }>;
-      openSubscribe: () => Promise<void>;
-      openRegister: () => Promise<void>;
-      onAuthChange: (cb: (data: { active: boolean; loggedIn: boolean; email: string }) => void) => () => void;
       updateInfo: (forceCheck?: boolean) => Promise<{ current: string; latest: { version: string; notes?: string[]; releasedAt?: string } | null; updateAvailable: boolean; downloaded: boolean }>;
       updateDownload: () => Promise<void>;
       updateInstall: () => Promise<void>;
