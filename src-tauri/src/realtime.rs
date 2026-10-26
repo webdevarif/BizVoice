@@ -17,6 +17,13 @@
 //   <- {"message_type":"session_started",     ...}
 //   <- {"message_type":"partial_transcript",  "text": "..."}
 //   <- {"message_type":"committed_transcript","text": "..."}
+//   <- {"message_type":"quota_exceeded" | "auth_error" | "rate_limited" | ...,
+//       "error": "..."}   (errors arrive as messages, not as a failed handshake)
+//
+// Reliability: every PCM chunk is also kept in memory for the whole session.
+// When the socket fails for any reason, recording carries on, and at stop the
+// full audio goes through the batch path (next key, then the fallback
+// provider). The live preview can die; the dictation cannot.
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
@@ -46,8 +53,20 @@ const EV_PARTIAL: &str = "live:partial";
 const EV_COMMITTED: &str = "live:committed";
 const EV_ERROR: &str = "live:error";
 
+/// Sample rate of the PCM the mic bar streams.
+pub const SAMPLE_RATE: u32 = 16_000;
+
+enum Out {
+    Audio(Vec<u8>),
+    /// Final chunk: ask the server to commit whatever it still holds.
+    Commit,
+}
+
 pub struct LiveSession {
-    audio_tx: mpsc::UnboundedSender<Vec<u8>>,
+    audio_tx: mpsc::UnboundedSender<Out>,
+    /// Every byte of PCM pushed this session, kept even after the socket dies
+    /// so the batch path can transcribe the whole dictation.
+    audio: Arc<Mutex<Vec<u8>>>,
     /// Committed segments in arrival order — this is what gets refined + pasted.
     committed: Arc<Mutex<Vec<String>>>,
     /// Set when the socket dies early, so `finish` can explain why rather than
@@ -66,6 +85,8 @@ pub struct LiveSession {
 /// What a stopped session produced.
 pub struct LiveResult {
     pub text: String,
+    /// The full session audio, 16 kHz mono PCM16.
+    pub pcm: Vec<u8>,
     /// Present when the socket died mid-dictation. With text alongside it the
     /// transcript is truncated — everything spoken after the death is gone — so
     /// the caller pastes what survived *and* tells the user.
@@ -86,7 +107,7 @@ fn lang_code(lang: &str) -> Option<&'static str> {
     }
 }
 
-fn socket_url(lang: &str) -> String {
+fn socket_url(lang: &str, vocabulary: &str) -> String {
     let mut url = format!(
         "{WS_BASE}?model_id={MODEL}&audio_format=pcm_16000&commit_strategy=vad&vad_silence_threshold_secs={VAD_SILENCE_SECS}"
     );
@@ -98,59 +119,77 @@ fn socket_url(lang: &str) -> String {
             url.push_str("&secondary_languages=eng");
         }
     }
+    // Realtime allows up to 50 keyterms of under 20 characters each.
+    for t in crate::pipeline::vocab_terms(vocabulary, 20, 50) {
+        url.push_str("&keyterms=");
+        url.push_str(&urlencode(&t));
+    }
     url
 }
 
-/// True when a handshake failure is worth retrying on a different key rather
-/// than reporting. Mirrors the batch failover in pipeline.rs.
-fn key_is_spent(err: &str) -> bool {
-    let l = err.to_lowercase();
-    l.contains("quota_exceeded")
-        || l.contains("insufficient")
-        || l.contains("401")
-        || l.contains("403")
-        || l.contains("429")
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
-/// Open a live session, trying each key in turn until one connects.
+/// Open a live session, trying keys in health order until one connects.
 ///
-/// Failover happens only at handshake. Mid-stream the protocol is terminal —
-/// the server reports and closes — and replaying buffered audio onto a fresh
-/// socket risks duplicating text, so a mid-stream death ends the session and
-/// `finish` returns whatever was committed before it, plus the error.
+/// A key whose account is spent often still completes the handshake and only
+/// then sends `quota_exceeded`. That case is handled by the reader: it marks
+/// the key as resting (so the next dictation starts on a good key) and the
+/// session's audio is recovered through the batch path at stop.
 pub async fn start(
     app: AppHandle,
     keys: Vec<(String, String)>,
     input_lang: String,
+    vocabulary: String,
 ) -> Result<LiveSession, String> {
+    use crate::keys as kh;
     if keys.is_empty() {
         return Err("No ElevenLabs key configured".into());
     }
 
-    let url = socket_url(&input_lang);
+    let url = socket_url(&input_lang, &vocabulary);
+    let mut worst: Option<kh::Failure> = None;
     let mut last = String::from("no key accepted the connection");
 
-    for (label, key) in &keys {
+    for (label, key) in kh::order(&keys) {
         let req = build_request(&url, key)?;
-
-        match tokio_tungstenite::connect_async(req).await {
-            Ok((stream, _)) => return Ok(spawn_pump(app, stream)),
-            Err(e) => {
+        let connect = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio_tungstenite::connect_async(req),
+        )
+        .await;
+        match connect {
+            Ok(Ok((stream, _))) => return Ok(spawn_pump(app, stream, label.clone())),
+            Ok(Err(e)) => {
                 let msg = e.to_string();
-                #[cfg(debug_assertions)]
-                eprintln!("[live] key {label:?} failed to connect: {msg}");
-                if !key_is_spent(&msg) {
-                    // A malformed URL or a network outage will fail identically
-                    // on every key; only spend the round trips when it's the
-                    // key that's at fault.
+                let kind = kh::classify_handshake(&msg);
+                eprintln!("[live] key {label:?} failed to connect ({kind:?}): {msg}");
+                kh::mark_bad(label, kind);
+                worst = Some(kh::worst(worst, kind));
+                last = format!("{label}: {msg}");
+                if !kind.try_next_key() {
                     return Err(format!("Live transcription failed to start: {msg}"));
                 }
-                last = format!("{label}: {msg}");
+            }
+            Err(_) => {
+                worst = Some(kh::worst(worst, kh::Failure::Transient));
+                last = format!("{label}: connect timed out");
             }
         }
     }
 
-    Err(format!("All ElevenLabs keys failed. Last error — {last}"))
+    Err(match worst {
+        Some(f) => kh::explain(f, &last),
+        None => last,
+    })
 }
 
 fn build_request(
@@ -169,32 +208,42 @@ fn build_request(
 type Sock =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+fn chunk_frame(pcm: &[u8], commit: bool) -> String {
+    use base64::Engine;
+    serde_json::json!({
+        "message_type": "input_audio_chunk",
+        "audio_base_64": base64::engine::general_purpose::STANDARD.encode(pcm),
+        "commit": commit,
+        "sample_rate": SAMPLE_RATE,
+    })
+    .to_string()
+}
+
 /// Split the socket and run both directions on the Tauri runtime: audio from an
 /// unbounded channel goes out, transcripts come in and are emitted to the mic
-/// bar. The channel is unbounded on purpose — the audio callback must never
+/// bar. The channel is unbounded on purpose: the audio callback must never
 /// block waiting on the network.
-fn spawn_pump(app: AppHandle, stream: Sock) -> LiveSession {
+fn spawn_pump(app: AppHandle, stream: Sock, label: String) -> LiveSession {
     let (mut writer, mut reader) = stream.split();
-    let (audio_tx, mut audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (audio_tx, mut audio_rx) = mpsc::unbounded_channel::<Out>();
 
     let committed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-    // Outbound: PCM -> base64 -> JSON frame.
+    // Outbound: PCM -> base64 -> JSON frame. A dead socket is not an error
+    // here: the reader reports why, and the audio is still in the buffer.
     tauri::async_runtime::spawn(async move {
-        use base64::Engine;
-        while let Some(pcm) = audio_rx.recv().await {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&pcm);
-            let frame = serde_json::json!({
-                "message_type": "input_audio_chunk",
-                "audio_base_64": b64,
-            });
-            if writer
-                .send(Message::Text(frame.to_string().into()))
-                .await
-                .is_err()
-            {
-                break; // reader task reports the reason
+        let mut alive = true;
+        while let Some(out) = audio_rx.recv().await {
+            if !alive {
+                continue; // drain so senders never see a closed channel
+            }
+            let frame = match out {
+                Out::Audio(pcm) => chunk_frame(&pcm, false),
+                Out::Commit => chunk_frame(&[], true),
+            };
+            if writer.send(Message::Text(frame.into())).await.is_err() {
+                alive = false;
             }
         }
         let _ = writer.close().await;
@@ -206,6 +255,22 @@ fn spawn_pump(app: AppHandle, stream: Sock) -> LiveSession {
     let stopping = Arc::new(AtomicBool::new(false));
     let stopping_in = stopping.clone();
     let reader = tauri::async_runtime::spawn(async move {
+        let fail = |why: String| {
+            let first = failure_in
+                .lock()
+                .map(|mut slot| {
+                    let first = slot.is_none();
+                    if first {
+                        *slot = Some(why.clone());
+                    }
+                    first
+                })
+                .unwrap_or(false);
+            if first {
+                let _ = app.emit_to("micbar", EV_ERROR, why);
+            }
+        };
+
         while let Some(msg) = reader.next().await {
             let text = match msg {
                 Ok(Message::Text(t)) => t.to_string(),
@@ -215,21 +280,17 @@ fn spawn_pump(app: AppHandle, stream: Sock) -> LiveSession {
                     if let Some(f) = frame {
                         if !f.reason.is_empty() {
                             let why = f.reason.to_string();
-                            if let Ok(mut slot) = failure_in.lock() {
-                                *slot = Some(why.clone());
+                            if let Some(kind) = crate::keys::classify_ws("error", &why) {
+                                crate::keys::mark_bad(&label, kind);
                             }
-                            let _ = app.emit_to("micbar", EV_ERROR, why);
+                            fail(why);
                         }
                     }
                     break;
                 }
                 Ok(_) => continue,
                 Err(e) => {
-                    let why = e.to_string();
-                    if let Ok(mut slot) = failure_in.lock() {
-                        *slot = Some(why.clone());
-                    }
-                    let _ = app.emit_to("micbar", EV_ERROR, why);
+                    fail(e.to_string());
                     break;
                 }
             };
@@ -241,6 +302,7 @@ fn spawn_pump(app: AppHandle, stream: Sock) -> LiveSession {
             let body = v.get("text").and_then(|x| x.as_str()).unwrap_or("");
 
             match kind {
+                "session_started" => crate::keys::mark_good(&label),
                 "partial_transcript" => {
                     let _ = app.emit_to("micbar", EV_PARTIAL, body);
                 }
@@ -252,31 +314,27 @@ fn spawn_pump(app: AppHandle, stream: Sock) -> LiveSession {
                     }
                     let _ = app.emit_to("micbar", EV_COMMITTED, body);
                 }
-                _ => {}
+                other => {
+                    let err = v.get("error").and_then(|x| x.as_str()).unwrap_or("");
+                    if let Some(f) = crate::keys::classify_ws(other, err) {
+                        eprintln!("[live] key {label:?} server error {other} ({f:?}): {err}");
+                        crate::keys::mark_bad(&label, f);
+                        fail(if err.is_empty() { other.to_string() } else { format!("{other}: {err}") });
+                    }
+                }
             }
         }
 
         // Reaching here means the socket is closed. If nobody asked for that,
-        // it dropped on its own — and a bare close or a vanished connection
-        // carries no reason for the arms above to record, so without this the
-        // dictation would be truncated with nothing anywhere saying why.
+        // it dropped on its own, and the dictation will be recovered at stop.
         if !stopping_in.load(Ordering::SeqCst) {
-            let recorded = failure_in.lock().ok().and_then(|mut slot| {
-                if slot.is_some() {
-                    return None; // already reported, with a better reason
-                }
-                let why = String::from("connection closed");
-                *slot = Some(why.clone());
-                Some(why)
-            });
-            if let Some(why) = recorded {
-                let _ = app.emit_to("micbar", EV_ERROR, why);
-            }
+            fail(String::from("connection closed"));
         }
     });
 
     LiveSession {
         audio_tx,
+        audio: Arc::new(Mutex::new(Vec::new())),
         committed,
         failure,
         reader,
@@ -285,33 +343,25 @@ fn spawn_pump(app: AppHandle, stream: Sock) -> LiveSession {
 }
 
 impl LiveSession {
-    /// Queue one chunk of 16 kHz mono PCM16. Never blocks; a closed socket just
-    /// drops the audio, which `finish` then reports.
+    /// Queue one chunk of 16 kHz mono PCM16. Never blocks. The chunk is kept
+    /// in the session buffer whether or not the socket is still alive.
     pub fn push_audio(&self, pcm: Vec<u8>) {
-        let _ = self.audio_tx.send(pcm);
+        if let Ok(mut a) = self.audio.lock() {
+            a.extend_from_slice(&pcm);
+        }
+        let _ = self.audio_tx.send(Out::Audio(pcm));
     }
 
-    /// Stop sending and return the joined committed transcript.
+    /// Stop sending and return the joined committed transcript plus the full
+    /// session audio.
     ///
-    /// Waits for the tail: when the user releases the hotkey the last phrase —
-    /// sometimes the last *two* — is still in flight, and dropping it would
-    /// silently truncate their sentence.
-    ///
-    /// The wait ends when the socket closes, not when a segment count changes.
-    /// Counting cannot distinguish "one tail commit landed, another is still
-    /// coming" from "everything has arrived", and it cannot tell "the tail
-    /// already landed before the user stopped" from "the tail is late" — so it
-    /// both lost text and stalled a fixed 3s on the commonest stop pattern.
-    ///
-    /// Measured against the live service: after the client close the server
-    /// flushes its pending commit at +253ms and closes at +276ms. So this
-    /// normally costs ~0.3s, not the 3s the old loop spent.
-    pub async fn finish(self) -> Result<LiveResult, String> {
-        // Closing the audio channel ends the writer task, which closes the
-        // socket and prompts the server to flush its final commits and close
-        // back — which is what ends the reader.
+    /// Sends a final `commit: true` so the server finalises the phrase it is
+    /// still holding, then closes. The reader ends when the server closes back
+    /// (normally ~0.3s); 3s is only a backstop for a server that never does.
+    pub async fn finish(self) -> LiveResult {
         let LiveSession {
             audio_tx,
+            audio,
             committed,
             failure,
             reader,
@@ -320,11 +370,10 @@ impl LiveSession {
         // Before anything closes, so the reader never mistakes our own shutdown
         // for the socket dying.
         stopping.store(true, Ordering::SeqCst);
+        let _ = audio_tx.send(Out::Commit);
         drop(audio_tx);
 
-        // Backstop only: a server that neither flushes nor closes must not hang
-        // the paste. A socket that already died resolves immediately.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(4), reader).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), reader).await;
 
         let text = committed
             .lock()
@@ -332,15 +381,63 @@ impl LiveSession {
             .unwrap_or_default()
             .trim()
             .to_string();
-
         let failure = failure.lock().ok().and_then(|f| f.clone());
+        let pcm = audio.lock().map(|mut a| std::mem::take(&mut *a)).unwrap_or_default();
+        LiveResult { text, pcm, failure }
+    }
+}
 
-        // Nothing survived — the failure is the whole story, so report it.
-        if text.is_empty() {
-            if let Some(err) = failure {
-                return Err(format!("Live transcription failed: {err}"));
-            }
-        }
-        Ok(LiveResult { text, failure })
+/// Wrap 16 kHz mono PCM16 in a WAV header so the batch endpoints accept it.
+pub fn pcm16_to_wav(pcm: &[u8]) -> Vec<u8> {
+    let data_len = pcm.len() as u32;
+    let byte_rate = SAMPLE_RATE * 2;
+    let mut w = Vec::with_capacity(44 + pcm.len());
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&(36 + data_len).to_le_bytes());
+    w.extend_from_slice(b"WAVEfmt ");
+    w.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+    w.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    w.extend_from_slice(&1u16.to_le_bytes()); // mono
+    w.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    w.extend_from_slice(&byte_rate.to_le_bytes());
+    w.extend_from_slice(&2u16.to_le_bytes()); // block align
+    w.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&data_len.to_le_bytes());
+    w.extend_from_slice(pcm);
+    w
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wav_header_is_valid() {
+        let pcm = vec![0u8; 32_000]; // 1s
+        let w = pcm16_to_wav(&pcm);
+        assert_eq!(w.len(), 44 + 32_000);
+        assert_eq!(&w[0..4], b"RIFF");
+        assert_eq!(u32::from_le_bytes(w[4..8].try_into().unwrap()), 36 + 32_000);
+        assert_eq!(u32::from_le_bytes(w[24..28].try_into().unwrap()), 16_000);
+        assert_eq!(u32::from_le_bytes(w[40..44].try_into().unwrap()), 32_000);
+    }
+
+    #[test]
+    fn frame_has_required_fields() {
+        let f: Value = serde_json::from_str(&chunk_frame(&[1, 2], true)).unwrap();
+        assert_eq!(f["message_type"], "input_audio_chunk");
+        assert_eq!(f["commit"], true);
+        assert_eq!(f["sample_rate"], 16_000);
+        assert_eq!(f["audio_base_64"], "AQI=");
+    }
+
+    #[test]
+    fn keyterms_are_encoded_into_url() {
+        let u = socket_url("bangla", "Next.js, Surfacly, a very long term that exceeds twenty");
+        assert!(u.contains("language_code=ben"));
+        assert!(u.contains("&keyterms=Next.js"));
+        assert!(u.contains("&keyterms=Surfacly"));
+        assert!(!u.contains("exceeds"));
     }
 }

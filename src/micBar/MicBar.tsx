@@ -50,6 +50,9 @@ function LogoGlyph({ size = 18, mono = false }: { size?: number; color?: string;
 
 // ── one-time WAV encoder registration ───────────────────────────────────────
 
+/** Presses shorter than this are accidental taps and are ignored. */
+const MIN_RECORDING_MS = 400;
+
 let wavEncoderPromise: Promise<void> | null = null;
 function ensureWavEncoder(): Promise<void> {
   if (!wavEncoderPromise) {
@@ -223,9 +226,18 @@ export function MicBar() {
     // The socket only reports terminal errors — a close with a reason, or a
     // read failure. Either way the session is over, so stop now: every further
     // word would go into a dead socket and be lost without the user knowing.
-    const removeLiveErr = window.api.onLiveError?.((msg) => {
-      liveErrRef.current = msg || 'Live transcription dropped';
-      if (liveNodeRef.current) void stopLiveRecording();
+    // The socket died (spent key, rate limit, network). Keep recording: the
+    // Rust side keeps every audio chunk and transcribes the whole session
+    // through the batch path at stop, so nothing the user says is lost. Only
+    // the live preview stops updating.
+    const removeLiveErr = window.api.onLiveError?.(() => {
+      setLivePart('Preview paused. Keep talking, all of it will be transcribed.');
+    });
+    // Notices from the backend outside a recording (e.g. tray retry failed).
+    const removeNotice = window.api.onDictationNotice?.((msg) => {
+      setError(msg || 'Something went wrong');
+      setState('error');
+      setTimeout(() => setState('idle'), 3000);
     });
     refreshSettings();
     window.addEventListener('focus', refreshSettings);
@@ -238,6 +250,7 @@ export function MicBar() {
       removeLive?.();
       removeLiveDone?.();
       removeLiveErr?.();
+      removeNotice?.();
       window.removeEventListener('focus', refreshSettings);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -323,8 +336,9 @@ export function MicBar() {
   async function submitB64(b64: string) {
     window.api.muteSystem(false);
     const durationMs = recStartRef.current ? Date.now() - recStartRef.current : 0;
-    // Ignore recordings shorter than 1s — go straight back to idle, no processing
-    if (durationMs < 1000) {
+    // A tap under MIN_RECORDING_MS is an accidental press, not speech. Short
+    // replies like "hya" or "ok" are longer than that, so they still go through.
+    if (durationMs < MIN_RECORDING_MS) {
       setState('idle');
       return;
     }
@@ -335,8 +349,10 @@ export function MicBar() {
         setState('done');
         await window.api.paste(text);
         await new Promise(r => setTimeout(r, 1000));
+        setState('idle');
+      } else {
+        showNothingHeard();
       }
-      setState('idle');
     } catch (err: any) {
       const msg = err?.message || (typeof err === 'string' ? err : '') || 'Transcription failed';
       setError(msg);
@@ -357,7 +373,10 @@ export function MicBar() {
       try {
         const b64 = await float32ToWavBase64(audio, 16000);
         return await window.api.transcribe(b64, durationMs);
-      } catch {
+      } catch (err: any) {
+        // Keep dictating, but remember it: the user is told at stop.
+        failedSegRef.current += 1;
+        lastSegErrRef.current = err?.message || String(err || '');
         return '';
       }
     })();
@@ -393,8 +412,8 @@ export function MicBar() {
       stopStream();
       const durationMs = recStartRef.current ? Date.now() - recStartRef.current : 0;
       const blob = new Blob(chunksRef.current, { type: 'audio/wav' });
-      // Too short or no audio — silently return to idle, no processing
-      if (durationMs < 1000 || !blob.size) {
+      // Accidental tap or no audio: back to idle, no processing.
+      if (durationMs < MIN_RECORDING_MS || !blob.size) {
         window.api.muteSystem(false);
         setState('idle');
         return;
@@ -448,6 +467,7 @@ export function MicBar() {
     // Fresh paste queue for this session.
     queueRef.current = Promise.resolve();
     pastedCountRef.current = 0;
+    failedSegRef.current = 0;
 
     const { MicVAD } = await import('@ricky0123/vad-web');
     const vad = await MicVAD.new({
@@ -503,6 +523,13 @@ export function MicBar() {
       stopAnalyser();
       stopStream();
       window.api.muteSystem(false);
+      if (failedSegRef.current > 0) {
+        const n = failedSegRef.current;
+        setError(`${n} phrase${n > 1 ? 's' : ''} failed: ${lastSegErrRef.current}`);
+        setState('error');
+        setTimeout(() => setState('idle'), 4000);
+        return;
+      }
       setState('idle');
       return;
     }
@@ -529,6 +556,16 @@ export function MicBar() {
   const liveNodeRef = useRef<AudioWorkletNode | null>(null);
   /** Set when the socket dies; shown after the salvaged text is pasted. */
   const liveErrRef  = useRef<string>('');
+  /** Live-dictation phrases that failed to transcribe this session. */
+  const failedSegRef   = useRef(0);
+  const lastSegErrRef  = useRef('');
+
+  /** The recording held no words. Say so instead of silently going idle. */
+  function showNothingHeard() {
+    setError("Didn't catch that. Tray > Retry Last Dictation tries again.");
+    setState('error');
+    setTimeout(() => setState('idle'), 2500);
+  }
 
   async function startLiveRecording(s: Awaited<ReturnType<typeof window.api.getSettings>>) {
     if (s.muteWhileRecording) window.api.muteSystem(true);
@@ -580,6 +617,8 @@ export function MicBar() {
     const durationMs = recStartRef.current ? Date.now() - recStartRef.current : 0;
     setState('processing');
     try {
+      // live_stop recovers a failed socket itself (full audio through the
+      // batch path), so a text here is always the complete dictation.
       const text = await window.api.liveStop(undefined, durationMs);
       setLiveDone('');
       setLivePart('');
@@ -587,18 +626,12 @@ export function MicBar() {
         setState('done');
         await window.api.paste(text);
         await new Promise(r => setTimeout(r, 1000));
+        setState('idle');
+      } else if (durationMs >= MIN_RECORDING_MS) {
+        showNothingHeard();
+      } else {
+        setState('idle');
       }
-      // A death mid-dictation still pastes what survived, but the transcript is
-      // truncated — refined into a well-formed sentence, so it reads complete.
-      // Say so rather than letting it pass as a finished dictation.
-      if (liveErrRef.current) {
-        setError(liveErrRef.current);
-        liveErrRef.current = '';
-        setState('error');
-        setTimeout(() => setState('idle'), 3000);
-        return;
-      }
-      setState('idle');
     } catch (err: any) {
       setLiveDone('');
       setLivePart('');

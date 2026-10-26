@@ -16,6 +16,7 @@
 // into the handler below; real logic is filled in per TAURI_MIGRATION.md.
 
 mod commands;
+mod keys;
 mod overlay;
 mod paste;
 mod pipeline;
@@ -188,6 +189,8 @@ pub fn run() {
             overlay::start_micbar_pin(app.handle());
             // Startup: show the mic bar (no account needed).
             commands::startup_gate(app.handle());
+            // Open TLS connections to the STT hosts before the first dictation.
+            tauri::async_runtime::spawn(pipeline::warm_up());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -220,6 +223,7 @@ pub fn run() {
             commands::refine_text,
             commands::get_refined_cache,
             commands::get_stats,
+            commands::retry_last,
             // Local whisper models (Phase 4)
             commands::whisper_list_models,
             commands::whisper_download_model,
