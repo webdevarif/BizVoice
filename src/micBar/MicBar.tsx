@@ -53,6 +53,15 @@ function LogoGlyph({ size = 18, mono = false }: { size?: number; color?: string;
 /** Presses shorter than this are accidental taps and are ignored. */
 const MIN_RECORDING_MS = 400;
 
+/** Tauri rejects invokes with a plain string, not an Error, so `err.message`
+ *  was undefined and every backend error showed as a generic fallback. */
+function errText(err: unknown, fallback: string): string {
+  if (typeof err === 'string' && err.trim()) return err;
+  const m = (err as { message?: unknown } | null)?.message;
+  if (typeof m === 'string' && m.trim()) return m;
+  return fallback;
+}
+
 let wavEncoderPromise: Promise<void> | null = null;
 function ensureWavEncoder(): Promise<void> {
   if (!wavEncoderPromise) {
@@ -235,9 +244,7 @@ export function MicBar() {
     });
     // Notices from the backend outside a recording (e.g. tray retry failed).
     const removeNotice = window.api.onDictationNotice?.((msg) => {
-      setError(msg || 'Something went wrong');
-      setState('error');
-      setTimeout(() => setState('idle'), 3000);
+      showError(msg || 'Something went wrong');
     });
     refreshSettings();
     window.addEventListener('focus', refreshSettings);
@@ -355,9 +362,7 @@ export function MicBar() {
       }
     } catch (err: any) {
       const msg = err?.message || (typeof err === 'string' ? err : '') || 'Transcription failed';
-      setError(msg);
-      setState('error');
-      setTimeout(() => setState('idle'), 3000);
+      showError(msg);
     }
   }
 
@@ -376,7 +381,7 @@ export function MicBar() {
       } catch (err: any) {
         // Keep dictating, but remember it: the user is told at stop.
         failedSegRef.current += 1;
-        lastSegErrRef.current = err?.message || String(err || '');
+        lastSegErrRef.current = errText(err, 'unknown error');
         return '';
       }
     })();
@@ -525,9 +530,7 @@ export function MicBar() {
       window.api.muteSystem(false);
       if (failedSegRef.current > 0) {
         const n = failedSegRef.current;
-        setError(`${n} phrase${n > 1 ? 's' : ''} failed: ${lastSegErrRef.current}`);
-        setState('error');
-        setTimeout(() => setState('idle'), 4000);
+        showError(`${n} phrase${n > 1 ? 's' : ''} failed: ${lastSegErrRef.current}`);
         return;
       }
       setState('idle');
@@ -560,11 +563,36 @@ export function MicBar() {
   const failedSegRef   = useRef(0);
   const lastSegErrRef  = useRef('');
 
+  const errTimerRef = useRef<number | null>(null);
+
+  /**
+   * Show an error the user can actually read: the window grows upward into a
+   * card above the pill with the full message, stays 8s (click to dismiss),
+   * and the message is written to the log (tray > Open Log). The pill alone is
+   * ~210px wide, so errors used to be cut to a few characters, or invisible
+   * in the icon-only styles.
+   */
+  function showError(msg: string) {
+    const text = (msg || 'Something went wrong').trim();
+    setError(text);
+    setState('error');
+    void window.api.logError?.(text);
+    void window.api.setMicBarExpanded?.(true);
+    if (errTimerRef.current) window.clearTimeout(errTimerRef.current);
+    errTimerRef.current = window.setTimeout(clearError, 8000);
+  }
+
+  function clearError() {
+    if (errTimerRef.current) window.clearTimeout(errTimerRef.current);
+    errTimerRef.current = null;
+    void window.api.setMicBarExpanded?.(false);
+    setError('');
+    if (stateRef.current === 'error') setState('idle');
+  }
+
   /** The recording held no words. Say so instead of silently going idle. */
   function showNothingHeard() {
-    setError("Didn't catch that. Tray > Retry Last Dictation tries again.");
-    setState('error');
-    setTimeout(() => setState('idle'), 2500);
+    showError("Didn't catch that. Tray > Retry Last Dictation tries again.");
   }
 
   async function startLiveRecording(s: Awaited<ReturnType<typeof window.api.getSettings>>) {
@@ -636,9 +664,7 @@ export function MicBar() {
       setLiveDone('');
       setLivePart('');
       liveErrRef.current = '';
-      setError(err?.message || 'Live transcription failed');
-      setState('error');
-      setTimeout(() => setState('idle'), 3000);
+      showError(errText(err, 'Live transcription failed'));
     }
   }
 
@@ -648,7 +674,7 @@ export function MicBar() {
     if (startingRef.current) return;
     startingRef.current = true;
     try {
-      setError('');
+      if (errTimerRef.current) clearError(); else setError('');
       const s = await window.api.getSettings();
       // Live preview needs premium Scribe and a key. Local mode wins over it,
       // exactly as it does on the batch path (transcribe resolves the on-device
@@ -678,9 +704,7 @@ export function MicBar() {
       stopStream();
       stopAnalyser();
       window.api.muteSystem(false);
-      setError(err?.message ?? 'Mic error');
-      setState('error');
-      setTimeout(() => setState('idle'), 2500);
+      showError(errText(err, 'Mic error'));
     } finally {
       startingRef.current = false;
     }
@@ -694,14 +718,13 @@ export function MicBar() {
 
   function toggle() {
     if (!hasKeyRef.current) {
-      setError('No API key — open Settings');
-      setState('error');
-      setTimeout(() => setState('idle'), 3000);
+      showError('No API key — open Settings');
       return;
     }
     const s = stateRef.current;
     if      (s === 'recording') stopRecording();
-    else if (s === 'idle')      startRecording();
+    // An error card on screen must not block the next dictation.
+    else if (s === 'idle' || s === 'error') { if (s === 'error') clearError(); startRecording(); }
   }
 
   // ── drag ──────────────────────────────────────────────────────────────────
@@ -740,7 +763,7 @@ export function MicBar() {
   const stateLabel =
     state === 'processing' ? 'Processing'   :
     state === 'done'       ? 'Pasted'       :
-    state === 'error'      ? (error || 'Error') :
+    state === 'error'      ? 'Error' :
     noKey                  ? 'No API Key'   :
     'Transcript';
 
@@ -757,6 +780,18 @@ export function MicBar() {
 
   return (
     <div className="w-full h-full flex flex-col items-center justify-end p-1" onMouseDown={onDragStart}>
+      {state === 'error' && error && (
+        <div
+          className={`nodrag mb-1.5 w-full max-w-[300px] rounded-xl px-3 py-2 text-[12px] leading-[1.35] cursor-pointer select-text shadow-lg border ${
+            lightText ? 'bg-white text-zinc-800 border-red-300' : 'bg-zinc-900/95 text-zinc-100 border-red-500/40'
+          }`}
+          style={{ display: '-webkit-box', WebkitLineClamp: 5, WebkitBoxOrient: 'vertical', overflow: 'hidden', wordBreak: 'break-word' }}
+          title="Click to dismiss. Full text: tray > Open Log"
+          onClick={clearError}
+        >
+          <span className="font-semibold text-red-400">Error: </span>{error}
+        </div>
+      )}
       <div
         className={`glow-wrap ${themeClass} ${glowClass} cursor-grab active:cursor-grabbing ${animPhase === 'entering' ? 'pill-enter' : ''}`}
         onAnimationEnd={() => setAnimPhase('visible')}

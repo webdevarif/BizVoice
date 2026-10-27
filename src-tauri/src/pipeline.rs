@@ -126,7 +126,7 @@ pub async fn run_pipeline(opts: PipelineOpts) -> Result<String, String> {
             // Every key failed. Rather than lose the dictation, fall back to
             // Groq Whisper when the user allows it and has a key.
             Err(e) if opts.stt_fallback && !opts.groq_key.is_empty() => {
-                eprintln!("[stt] scribe failed, falling back to Groq: {e}");
+                applog!("[stt] scribe failed, falling back to Groq: {e}");
                 force_groq = true;
                 String::new()
             }
@@ -137,7 +137,7 @@ pub async fn run_pipeline(opts: PipelineOpts) -> Result<String, String> {
             // fall through to the Whisper path below
         } else {
         #[cfg(debug_assertions)]
-        eprintln!("[stt] scribe raw = {raw:?}");
+        applog!("[stt] scribe raw = {raw:?}");
         if raw.is_empty() {
             return Ok(String::new());
         }
@@ -205,7 +205,7 @@ pub async fn run_pipeline(opts: PipelineOpts) -> Result<String, String> {
         .trim()
         .to_string();
     #[cfg(debug_assertions)]
-    eprintln!("[stt] cloud ({}) raw = {raw:?}", opts.stt_provider);
+    applog!("[stt] cloud ({}) raw = {raw:?}", opts.stt_provider);
 
     if raw.is_empty() {
         return Ok(String::new());
@@ -476,7 +476,7 @@ pub async fn scribe_stt(
                 return Ok(text);
             }
             Err((err, kind)) => {
-                eprintln!("[stt] scribe key {label:?} failed ({kind:?}): {err}");
+                applog!("[stt] scribe key {label:?} failed ({kind:?}): {err}");
                 keys::mark_bad(label, kind);
                 worst = Some(keys::worst(worst, kind));
                 last = format!("{label}: {err}");
@@ -591,7 +591,7 @@ pub async fn gpt_refine(opts: &PipelineOpts, raw: String) -> String {
             req = req.header(k.as_str(), v.as_str());
         }
         #[cfg(debug_assertions)]
-        eprintln!("[refine] try provider={} model={model}", opts.gpt_provider);
+        applog!("[refine] try provider={} model={model}", opts.gpt_provider);
         match req.send().await {
             Ok(r) if r.status().is_success() => {
                 let v = r.json::<Value>().await.unwrap_or(Value::Null);
@@ -604,7 +604,7 @@ pub async fn gpt_refine(opts: &PipelineOpts, raw: String) -> String {
                 let clean = sanitize_refined(&out);
                 if !clean.is_empty() {
                     #[cfg(debug_assertions)]
-                    eprintln!("[refine] out={clean:?}");
+                    applog!("[refine] out={clean:?}");
                     return clean;
                 }
             }
@@ -614,7 +614,7 @@ pub async fn gpt_refine(opts: &PipelineOpts, raw: String) -> String {
                 {
                     let st = _r.status();
                     let body = _r.text().await.unwrap_or_default();
-                    eprintln!(
+                    applog!(
                         "[refine] model={model} HTTP {st} — trying next. body: {}",
                         body.chars().take(200).collect::<String>()
                     );
@@ -623,7 +623,7 @@ pub async fn gpt_refine(opts: &PipelineOpts, raw: String) -> String {
             // Network/transport error — log and try the next model.
             Err(_e) => {
                 #[cfg(debug_assertions)]
-                eprintln!("[refine] model={model} request failed — trying next: {_e}");
+                applog!("[refine] model={model} request failed — trying next: {_e}");
             }
         }
     }

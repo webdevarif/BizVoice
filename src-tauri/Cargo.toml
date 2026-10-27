@@ -79,7 +79,9 @@ debug = false
 # on this low-RAM machine. The installer size win comes from WebView2 (no bundled
 # Chromium) — not LTO — so keep the first installer build fast. Re-enable
 # `lto = true` + `codegen-units = 1` for the final shipping build to trim a few MB.
-panic = "abort"
+# unwind, not abort: a panic in one command or task must fail that dictation,
+# not close the app (abort killed the whole process with no trace).
+panic = "unwind"
 opt-level = "s"
 strip = true
 codegen-units = 16

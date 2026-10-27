@@ -15,6 +15,8 @@
 // The full IPC surface is stubbed in `commands` (Phase 2 skeleton) and wired
 // into the handler below; real logic is filled in per TAURI_MIGRATION.md.
 
+#[macro_use]
+mod applog;
 mod commands;
 mod keys;
 mod overlay;
@@ -104,6 +106,7 @@ fn load_dotenv_dev() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    applog::install_panic_hook();
     // Pull BIZGROWHUB_API (and friends) from .env.local/.env in dev so the redirect
     // host matches the configured backend instead of the localhost debug fallback.
     #[cfg(debug_assertions)]
@@ -191,6 +194,16 @@ pub fn run() {
             commands::startup_gate(app.handle());
             // Open TLS connections to the STT hosts before the first dictation.
             tauri::async_runtime::spawn(pipeline::warm_up());
+            // Start the paste helper now: its first launch compiles C# (~1-2s),
+            // which used to land on the first dictation.
+            {
+                let h = app.handle().clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = paste::ensure_worker(&h) {
+                        applog!("[paste] worker failed to start: {e}");
+                    }
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -224,6 +237,8 @@ pub fn run() {
             commands::get_refined_cache,
             commands::get_stats,
             commands::retry_last,
+            commands::log_error,
+            commands::set_mic_bar_expanded,
             // Local whisper models (Phase 4)
             commands::whisper_list_models,
             commands::whisper_download_model,

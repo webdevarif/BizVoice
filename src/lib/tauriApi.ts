@@ -101,6 +101,8 @@ const api: Window['api'] = {
   onLiveError: (cb) => sub('live:error', cb),
   onDictationNotice: (cb) => sub('dictation:notice', cb),
   retryLast: () => invoke('retry_last'),
+  logError: (message: string) => invoke('log_error', { message }),
+  setMicBarExpanded: (expanded: boolean) => invoke('set_mic_bar_expanded', { expanded }),
 
   // ── Live transcription (realtime STT) ──
   liveStart: (inputLang?: string) => invoke('live_start', { forceLang: inputLang }),
@@ -199,6 +201,8 @@ declare global {
       /** A backend notice to show in the mic bar, e.g. a failed tray retry. */
       onDictationNotice: (cb: (message: string) => void) => () => void;
       retryLast: () => Promise<string>;
+      logError: (message: string) => Promise<void>;
+      setMicBarExpanded: (expanded: boolean) => Promise<void>;
       liveStart: (inputLang?: string) => Promise<void>;
       livePush: (chunk: string) => Promise<void>;
       liveStop: (inputLang?: string, durationMs?: number) => Promise<string>;

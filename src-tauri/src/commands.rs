@@ -515,7 +515,7 @@ pub async fn live_stop(
     let min_speech_bytes = (crate::realtime::SAMPLE_RATE as usize) * 2 / 2; // 0.5s
     if failure.is_some() || (raw.is_empty() && pcm.len() >= min_speech_bytes) {
         if let Some(err) = &failure {
-            eprintln!("[live] socket failed ({err}); recovering via batch");
+            applog!("[live] socket failed ({err}); recovering via batch");
         }
         if pcm.len() < min_speech_bytes {
             return Ok(String::new());
@@ -886,6 +886,13 @@ pub fn paste(app: tauri::AppHandle, text: String) -> Result<(), String> {
     crate::paste::paste_text(&app, text)
 }
 
+/// Errors shown in the mic bar, so they also end up in the log file.
+#[tauri::command]
+pub fn log_error(message: String) {
+    let m: String = message.chars().take(500).collect();
+    applog!("[ui] {m}");
+}
+
 const LAST_AUDIO_FILE: &str = "last-dictation.wav";
 
 /// Keep the most recent recording on disk so a failed or wrong transcription
@@ -937,6 +944,32 @@ pub fn mic_bar_context_menu(app: tauri::AppHandle, window: Window) -> Result<(),
         .map_err(|e| e.to_string())?;
     menu.popup(window).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Grow the mic bar window upward to show an error card above the pill, or
+/// shrink it back. The bottom-centre stays put, so the pill does not jump.
+/// The normal 210x46 window is too small for any real error message, which is
+/// why errors used to show as a truncated "Scribe fa…" or not at all.
+#[tauri::command]
+pub fn set_mic_bar_expanded(window: Window, expanded: bool) -> Result<(), String> {
+    const NORMAL: (f64, f64) = (210.0, 46.0);
+    const EXPANDED: (f64, f64) = (320.0, 150.0);
+    let (w, h) = if expanded { EXPANDED } else { NORMAL };
+    let scale = window.scale_factor().map_err(|e| e.to_string())?;
+    let pos = window.outer_position().map_err(|e| e.to_string())?;
+    let size = window.outer_size().map_err(|e| e.to_string())?;
+    let (nw, nh) = ((w * scale).round() as i32, (h * scale).round() as i32);
+    if nw == size.width as i32 && nh == size.height as i32 {
+        return Ok(());
+    }
+    let cx = pos.x + size.width as i32 / 2;
+    let bottom = pos.y + size.height as i32;
+    window
+        .set_size(tauri::PhysicalSize::new(nw as u32, nh as u32))
+        .map_err(|e| e.to_string())?;
+    window
+        .set_position(tauri::PhysicalPosition::new(cx - nw / 2, bottom - nh))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1019,10 +1052,11 @@ pub fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show_micbar", "Show Mic Bar", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
     let retry = MenuItem::with_id(app, "retry_last", "Retry Last Dictation", true, None::<&str>)?;
+    let open_log = MenuItem::with_id(app, "open_log", "Open Log", true, None::<&str>)?;
     let updates = MenuItem::with_id(app, "check_updates", "Check for Updates", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &retry, &settings, &updates, &sep, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &retry, &settings, &open_log, &updates, &sep, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id("main-tray")
         .tooltip("BizVoice")
@@ -1052,6 +1086,21 @@ pub fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 pub fn handle_menu(app: &tauri::AppHandle, id: &str) {
     match id {
         "show_micbar" => show_micbar(app),
+        "open_log" => {
+            if let Some(p) = crate::applog::path() {
+                if !p.exists() {
+                    crate::applog::write("[log] opened");
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    let _ = std::process::Command::new("notepad.exe")
+                        .arg(&p)
+                        .creation_flags(0x0800_0000)
+                        .spawn();
+                }
+            }
+        }
         "retry_last" => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {

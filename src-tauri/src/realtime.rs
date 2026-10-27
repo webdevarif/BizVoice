@@ -80,6 +80,10 @@ pub struct LiveSession {
     /// Set by `finish` before it closes anything, so the reader can tell an
     /// expected end-of-session from the socket dying under it.
     stopping: Arc<AtomicBool>,
+    /// Pinged on every committed segment that arrives after the final commit
+    /// was sent. `finish` returns once these go quiet, instead of always
+    /// waiting for the server to close the socket.
+    after_commit: Arc<tokio::sync::Notify>,
 }
 
 /// What a stopped session produced.
@@ -162,7 +166,7 @@ pub async fn start(
             Ok(Err(e)) => {
                 let msg = e.to_string();
                 let kind = kh::classify_handshake(&msg);
-                eprintln!("[live] key {label:?} failed to connect ({kind:?}): {msg}");
+                applog!("[live] key {label:?} failed to connect ({kind:?}): {msg}");
                 kh::mark_bad(label, kind);
                 worst = Some(kh::worst(worst, kind));
                 last = format!("{label}: {msg}");
@@ -246,6 +250,8 @@ fn spawn_pump(app: AppHandle, stream: Sock, label: String, lang: String) -> Live
     let failure_in = failure.clone();
     let stopping = Arc::new(AtomicBool::new(false));
     let stopping_in = stopping.clone();
+    let after_commit = Arc::new(tokio::sync::Notify::new());
+    let after_commit_in = after_commit.clone();
     let reader = tauri::async_runtime::spawn(async move {
         let fail = |why: String| {
             let first = failure_in
@@ -304,11 +310,14 @@ fn spawn_pump(app: AppHandle, stream: Sock, label: String, lang: String) -> Live
                     }
                 }
                 "committed_transcript" => {
+                    if stopping_in.load(Ordering::SeqCst) {
+                        after_commit_in.notify_one();
+                    }
                     if !script.accepts(body) {
                         // A final segment in the wrong script would be pasted
                         // as-is. Mark the session for batch recovery instead
                         // (batch pins language_code and sees all the audio).
-                        eprintln!("[live] committed text in wrong script, will re-transcribe");
+                        applog!("[live] committed text in wrong script, will re-transcribe");
                         if let Ok(mut slot) = failure_in.lock() {
                             slot.get_or_insert_with(|| "wrong script".to_string());
                         }
@@ -324,7 +333,7 @@ fn spawn_pump(app: AppHandle, stream: Sock, label: String, lang: String) -> Live
                 other => {
                     let err = v.get("error").and_then(|x| x.as_str()).unwrap_or("");
                     if let Some(f) = crate::keys::classify_ws(other, err) {
-                        eprintln!("[live] key {label:?} server error {other} ({f:?}): {err}");
+                        applog!("[live] key {label:?} server error {other} ({f:?}): {err}");
                         crate::keys::mark_bad(&label, f);
                         fail(if err.is_empty() { other.to_string() } else { format!("{other}: {err}") });
                     }
@@ -346,6 +355,7 @@ fn spawn_pump(app: AppHandle, stream: Sock, label: String, lang: String) -> Live
         failure,
         reader,
         stopping,
+        after_commit,
     }
 }
 
@@ -373,6 +383,7 @@ impl LiveSession {
             failure,
             reader,
             stopping,
+            after_commit,
         } = self;
         // Before anything closes, so the reader never mistakes our own shutdown
         // for the socket dying.
@@ -380,7 +391,28 @@ impl LiveSession {
         let _ = audio_tx.send(Out::Commit);
         drop(audio_tx);
 
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), reader).await;
+        // Return as soon as the commit's transcript has arrived and nothing
+        // else follows for 250ms (a VAD segment can land just before it), or
+        // when the socket closes, or after 3s at most. Usually ~0.3-0.6s
+        // instead of a fixed wait for the close handshake.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut reader = reader;
+        let closed = tokio::select! {
+            _ = after_commit.notified() => false,
+            _ = &mut reader => true,
+            _ = tokio::time::sleep_until(deadline) => true,
+        };
+        if !closed {
+            loop {
+                let quiet = tokio::time::sleep(std::time::Duration::from_millis(250));
+                tokio::select! {
+                    _ = after_commit.notified() => continue,
+                    _ = &mut reader => break,
+                    _ = quiet => break,
+                    _ = tokio::time::sleep_until(deadline) => break,
+                }
+            }
+        }
 
         let text = committed
             .lock()
