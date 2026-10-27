@@ -29,6 +29,49 @@ pub struct PipelineOpts {
     /// The user's ElevenLabs keys as (label, key), tried in order. More than one
     /// lets dictation survive an account running out of credits mid-session.
     pub elevenlabs_keys: Vec<(String, String)>,
+    /// When every ElevenLabs key fails, transcribe with Groq Whisper instead of
+    /// failing the dictation (needs a Groq key).
+    pub stt_fallback: bool,
+}
+
+/// One HTTP client for the whole app. Reusing it keeps TLS connections to the
+/// STT providers alive between dictations, so only the first request pays
+/// for the handshake.
+pub fn http() -> &'static reqwest::Client {
+    static C: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+/// Open connections to the STT hosts ahead of the first dictation.
+pub async fn warm_up() {
+    for url in ["https://api.elevenlabs.io/v1/models", "https://api.groq.com/openai/v1/models"] {
+        let _ = http().head(url).timeout(Duration::from_secs(5)).send().await;
+    }
+}
+
+/// Split the user's vocabulary ("Next.js, Supabase\nSurfacly") into terms.
+pub fn vocab_terms(vocab: &str, max_len: usize, max_count: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in vocab.split(|c| c == ',' || c == '\n' || c == ';') {
+        let t = t.trim();
+        if t.is_empty() || t.chars().count() >= max_len || t.split_whitespace().count() > 5 {
+            continue;
+        }
+        if !out.iter().any(|o| o.eq_ignore_ascii_case(t)) {
+            out.push(t.to_string());
+        }
+        if out.len() >= max_count {
+            break;
+        }
+    }
+    out
 }
 
 /// Subset of pipeline.ts LANG_TO_ISO (app label → ISO-639-1). Returns None for
@@ -69,16 +112,30 @@ pub async fn run_pipeline(opts: PipelineOpts) -> Result<String, String> {
         return Err(format!("Audio too short ({} bytes). Try again.", bytes.len()));
     }
 
-    let client = reqwest::Client::new();
+    let client = http();
     let iso = to_iso(&opts.input_lang);
 
     // ── Premium STT — ElevenLabs Scribe, direct with the user's own keys ────
     // Best-in-class accuracy. Takes priority over the other STT paths when on
     // and at least one key is saved. No fallback to Whisper: the user chose
     // premium, so we surface failures instead of silently returning worse text.
+    let mut force_groq = false;
     if opts.use_scribe && !opts.elevenlabs_keys.is_empty() {
-        let raw = scribe_stt(&client, &opts, &bytes).await?;
+        let raw = match scribe_stt(client, &opts, &bytes).await {
+            Ok(t) => t,
+            // Every key failed. Rather than lose the dictation, fall back to
+            // Groq Whisper when the user allows it and has a key.
+            Err(e) if opts.stt_fallback && !opts.groq_key.is_empty() => {
+                eprintln!("[stt] scribe failed, falling back to Groq: {e}");
+                force_groq = true;
+                String::new()
+            }
+            Err(e) => return Err(e),
+        };
         let raw = raw.trim().to_string();
+        if force_groq {
+            // fall through to the Whisper path below
+        } else {
         #[cfg(debug_assertions)]
         eprintln!("[stt] scribe raw = {raw:?}");
         if raw.is_empty() {
@@ -90,10 +147,12 @@ pub async fn run_pipeline(opts: PipelineOpts) -> Result<String, String> {
             return Ok(raw);
         }
         return Ok(gpt_refine(&opts, raw).await);
+        }
     }
 
     // ── STT (OpenAI or Groq, both OpenAI-compatible /audio/transcriptions) ──
-    let (stt_base, stt_key, stt_model) = if opts.stt_provider == "groq" && !opts.groq_key.is_empty() {
+    let use_groq = (force_groq || opts.stt_provider == "groq") && !opts.groq_key.is_empty();
+    let (stt_base, stt_key, stt_model) = if use_groq {
         (
             "https://api.groq.com/openai/v1",
             opts.groq_key.clone(),
@@ -128,7 +187,7 @@ pub async fn run_pipeline(opts: PipelineOpts) -> Result<String, String> {
         .post(format!("{stt_base}/audio/transcriptions"))
         .bearer_auth(&stt_key)
         .multipart(form)
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(25))
         .send()
         .await
         .map_err(|e| format!("STT request failed: {e}"))?;
@@ -188,8 +247,7 @@ fn is_quota_error(body: &str) -> bool {
 /// Check one key and report its balance. Powers the per-key "Test" button.
 /// Never returns Err: a rejected key is a result to render, not a failure.
 pub async fn probe_elevenlabs_key(key: &str) -> Value {
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = http()
         .get(format!("{EL_API}/user/subscription"))
         .header("xi-api-key", key)
         .timeout(Duration::from_secs(15))
@@ -242,9 +300,11 @@ pub async fn probe_elevenlabs_key(key: &str) -> Value {
     })
 }
 
-/// One Scribe attempt with a single key. `Ok(text)` on success; `Err((msg,
-/// key_spent))` otherwise, where `key_spent` marks the errors worth failing
-/// over for rather than reporting immediately.
+/// Scribe batch model. v2 is the current model: better accuracy and the only
+/// one that takes `keyterms`.
+const SCRIBE_MODEL: &str = "scribe_v2";
+
+/// One Scribe attempt with a single key.
 async fn scribe_attempt(
     client: &reqwest::Client,
     key: &str,
@@ -252,13 +312,15 @@ async fn scribe_attempt(
     // 'static because reqwest's multipart text parts must own or outlive the
     // request; every value comes from scribe_lang's fixed set of literals.
     lang: Option<&'static str>,
-) -> Result<String, (String, bool)> {
+    keyterms: &[String],
+) -> Result<String, (String, crate::keys::Failure)> {
+    use crate::keys::Failure;
     let part = reqwest::multipart::Part::bytes(audio.to_vec())
         .file_name("audio.wav")
         .mime_str("audio/wav")
-        .map_err(|e| (e.to_string(), false))?;
+        .map_err(|e| (e.to_string(), Failure::Fatal))?;
     let mut form = reqwest::multipart::Form::new()
-        .text("model_id", "scribe_v1")
+        .text("model_id", SCRIBE_MODEL)
         // Scribe otherwise annotates non-speech sounds inline, so a cough or a
         // laugh gets typed into the user's document as "(laughs)". Dictation
         // wants the words only.
@@ -267,25 +329,28 @@ async fn scribe_attempt(
     if let Some(code) = lang {
         form = form.text("language_code", code);
     }
+    // Names and jargon from the user's vocabulary. Keyterms cost extra per
+    // request, so they are only sent when the user has set some.
+    for t in keyterms {
+        form = form.text("keyterms", t.clone());
+    }
 
     let resp = client
         .post(format!("{EL_API}/speech-to-text"))
         .header("xi-api-key", key)
         .multipart(form)
-        .timeout(Duration::from_secs(60))
+        // A dictation clip transcribes in 1-3s. 25s is a hung request, and
+        // the next key (or the fallback) is a better bet than waiting longer.
+        .timeout(Duration::from_secs(25))
         .send()
         .await
-        // A network blip isn't this key's fault, but another key is on a fresh
-        // connection anyway, so it's still worth moving on.
-        .map_err(|e| (format!("Scribe request failed: {e}"), true))?;
+        .map_err(|e| (format!("Scribe request failed: {e}"), Failure::Transient))?;
 
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
 
     if !status.is_success() {
-        let retryable =
-            is_quota_error(&body) || status.as_u16() == 401 || status.as_u16() == 429 || status.is_server_error();
-
+        let kind = crate::keys::classify_http(status.as_u16(), &body);
         // A key created without the speech_to_text scope authenticates fine and
         // then fails here, which reads as a baffling 401 unless we say so.
         let msg = if body.to_lowercase().contains("missing_permissions") {
@@ -294,10 +359,10 @@ async fn scribe_attempt(
             let snippet: String = body.chars().take(200).collect();
             format!("Scribe failed ({status}): {snippet}")
         };
-        return Err((msg, retryable));
+        return Err((msg, kind));
     }
 
-    let data: Value = serde_json::from_str(&body).map_err(|e| (e.to_string(), false))?;
+    let data: Value = serde_json::from_str(&body).map_err(|e| (e.to_string(), Failure::Transient))?;
     Ok(data
         .get("text")
         .and_then(|v| v.as_str())
@@ -305,36 +370,43 @@ async fn scribe_attempt(
         .to_string())
 }
 
-/// Transcribe via ElevenLabs Scribe using the user's own keys, walking the list
-/// until one succeeds. A key that reports `quota_exceeded` is skipped and the
-/// same audio is retried on the next one, so a drained account costs the user
-/// a little latency instead of a failed dictation.
-async fn scribe_stt(
+/// Transcribe via ElevenLabs Scribe using the user's own keys. Starts from the
+/// key that worked last, skips keys known to be spent, and retries the same
+/// audio on the next key, so a drained account costs a little latency once
+/// instead of a failed dictation every time.
+pub async fn scribe_stt(
     client: &reqwest::Client,
     opts: &PipelineOpts,
     audio: &[u8],
 ) -> Result<String, String> {
+    use crate::keys;
     let lang = scribe_lang(&opts.input_lang);
+    let terms = vocab_terms(&opts.vocabulary, 50, 100);
+    let mut worst: Option<keys::Failure> = None;
     let mut last = "no ElevenLabs key configured".to_string();
 
-    for (label, key) in &opts.elevenlabs_keys {
-        match scribe_attempt(client, key, audio, lang).await {
-            Ok(text) => return Ok(text),
-            Err((err, retryable)) => {
-                #[cfg(debug_assertions)]
-                eprintln!("[stt] scribe key {label:?} failed (retryable={retryable}): {err}");
-                if !retryable {
+    for (label, key) in keys::order(&opts.elevenlabs_keys) {
+        match scribe_attempt(client, key, audio, lang, &terms).await {
+            Ok(text) => {
+                keys::mark_good(label);
+                return Ok(text);
+            }
+            Err((err, kind)) => {
+                eprintln!("[stt] scribe key {label:?} failed ({kind:?}): {err}");
+                keys::mark_bad(label, kind);
+                worst = Some(keys::worst(worst, kind));
+                last = format!("{label}: {err}");
+                if !kind.try_next_key() {
                     return Err(err);
                 }
-                last = format!("{label}: {err}");
             }
         }
     }
 
-    Err(format!(
-        "All {} ElevenLabs key(s) failed. Last error — {last}",
-        opts.elevenlabs_keys.len()
-    ))
+    Err(match worst {
+        Some(f) => keys::explain(f, &last),
+        None => last,
+    })
 }
 
 /// GPT format/refine step (OpenAI-compatible chat/completions) using the active
@@ -416,7 +488,7 @@ pub async fn gpt_refine(opts: &PipelineOpts, raw: String) -> String {
     }
     models.dedup();
 
-    let client = reqwest::Client::new();
+    let client = http();
     for model in &models {
         let body = serde_json::json!({
             "model": model,

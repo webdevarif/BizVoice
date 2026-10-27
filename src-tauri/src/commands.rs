@@ -322,6 +322,8 @@ fn default_settings() -> Value {
         "customKeyEncrypted": "",
         "useBetterBangla": false,
         "useScribe": false,
+        // Groq Whisper takes over when every ElevenLabs key fails.
+        "sttFallback": true,
         // The user's own ElevenLabs keys, tried in order with failover.
         "elevenlabsKeys": [],
         "scribeMigratedV2": false,
@@ -458,7 +460,8 @@ pub async fn live_start(
             .to_string(),
     };
 
-    let session = crate::realtime::start(app.clone(), keys, lang).await?;
+    let vocab = s.get("vocabulary").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let session = crate::realtime::start(app.clone(), keys, lang, vocab).await?;
     if let Ok(mut slot) = state.0.lock() {
         *slot = Some(session);
     }
@@ -502,13 +505,29 @@ pub async fn live_stop(
     // emits `live:error` at the moment it happens, which is what stops the
     // recording. Re-emitting here would only risk the duplicate landing inside
     // a *later* session and cutting that one short.
-    let crate::realtime::LiveResult { text: raw, failure } = session.finish().await?;
-    #[cfg(debug_assertions)]
-    if let Some(err) = &failure {
-        eprintln!("[live] truncated transcript — session died: {err}");
-    }
-    let _ = failure;
+    let crate::realtime::LiveResult { text: raw, pcm, failure } = session.finish().await;
 
+    // The batch path is the safety net. Use it when the socket failed at any
+    // point (the committed text is then missing everything after the failure)
+    // or when it returned nothing for audio that is long enough to hold
+    // speech. Either way the whole session audio is transcribed again, on the
+    // next healthy key or the fallback provider, so no words are lost.
+    let min_speech_bytes = (crate::realtime::SAMPLE_RATE as usize) * 2 / 2; // 0.5s
+    if failure.is_some() || (raw.is_empty() && pcm.len() >= min_speech_bytes) {
+        if let Some(err) = &failure {
+            eprintln!("[live] socket failed ({err}); recovering via batch");
+        }
+        if pcm.len() < min_speech_bytes {
+            return Ok(String::new());
+        }
+        use base64::Engine;
+        let wav = crate::realtime::pcm16_to_wav(&pcm);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
+        let dur = duration_ms.map(|d| d.max(0) as u64);
+        return Box::pin(transcribe(app, b64, dur)).await;
+    }
+
+    save_last_audio(&app, &crate::realtime::pcm16_to_wav(&pcm));
     if raw.is_empty() {
         return Ok(String::new());
     }
@@ -585,6 +604,8 @@ pub fn get_settings(app: tauri::AppHandle) -> Result<Value, String> {
 
 #[tauri::command]
 pub fn set_settings(app: tauri::AppHandle, mut patch: Value) -> Result<Value, String> {
+    // Keys may have been added, removed or fixed: re-learn their health.
+    crate::keys::reset();
     obfuscate_keys(&mut patch);
     let store = app.store(SETTINGS_STORE).map_err(|e| e.to_string())?;
     let mut current = store.get(SETTINGS_KEY).unwrap_or_else(default_settings);
@@ -755,6 +776,13 @@ pub async fn transcribe(
         str_field("gptModel", "gpt-4o-mini")
     };
 
+    {
+        use base64::Engine;
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(audio_base64.as_bytes()) {
+            save_last_audio(&app, &bytes);
+        }
+    }
+
     let opts = crate::pipeline::PipelineOpts {
         audio_base64,
         openai_key: decode_key(&s, "openaiKeyEncrypted"),
@@ -774,6 +802,7 @@ pub async fn transcribe(
         vocabulary: str_field("vocabulary", ""),
         use_scribe: s.get("useScribe").and_then(|v| v.as_bool()).unwrap_or(false),
         elevenlabs_keys: decode_elevenlabs_keys(&s),
+        stt_fallback: s.get("sttFallback").and_then(|v| v.as_bool()).unwrap_or(true),
     };
 
     // Local whisper path: when enabled with a downloaded model, run STT via
@@ -855,6 +884,36 @@ pub fn paste(app: tauri::AppHandle, text: String) -> Result<(), String> {
     // (Shift+Insert for editors/terminals, char-type for browsers, Ctrl+V
     // otherwise). See src/paste.rs — a faithful port of index.ts TYPE_PS_SCRIPT.
     crate::paste::paste_text(&app, text)
+}
+
+const LAST_AUDIO_FILE: &str = "last-dictation.wav";
+
+/// Keep the most recent recording on disk so a failed or wrong transcription
+/// can be retried without speaking again. Overwritten on every dictation.
+fn save_last_audio(app: &tauri::AppHandle, wav: &[u8]) {
+    if wav.len() <= 44 {
+        return;
+    }
+    if let Ok(dir) = app.path().app_data_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join(LAST_AUDIO_FILE), wav);
+    }
+}
+
+/// Transcribe the last recording again (tray "Retry Last Dictation").
+#[tauri::command]
+pub async fn retry_last(app: tauri::AppHandle) -> Result<String, String> {
+    use base64::Engine;
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join(LAST_AUDIO_FILE);
+    let wav = std::fs::read(&path).map_err(|_| "No recording to retry yet.".to_string())?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
+    // 16 kHz mono PCM16 = 32 bytes per ms; other rates only skew the stat.
+    let dur = (wav.len().saturating_sub(44) / 32) as u64;
+    Box::pin(transcribe(app, b64, Some(dur))).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -959,10 +1018,11 @@ pub fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 
     let show = MenuItem::with_id(app, "show_micbar", "Show Mic Bar", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
+    let retry = MenuItem::with_id(app, "retry_last", "Retry Last Dictation", true, None::<&str>)?;
     let updates = MenuItem::with_id(app, "check_updates", "Check for Updates", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &settings, &updates, &sep, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &retry, &settings, &updates, &sep, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id("main-tray")
         .tooltip("BizVoice")
@@ -992,6 +1052,21 @@ pub fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 pub fn handle_menu(app: &tauri::AppHandle, id: &str) {
     match id {
         "show_micbar" => show_micbar(app),
+        "retry_last" => {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                match retry_last(app.clone()).await {
+                    Ok(text) if !text.is_empty() => {
+                        let _ = crate::paste::paste_text(&app, text);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        use tauri::Emitter;
+                        let _ = app.emit_to("micbar", "dictation:notice", e);
+                    }
+                }
+            });
+        }
         "settings" | "ctx_settings" => {
             let _ = focus_or_open_settings(app);
         }
@@ -1726,6 +1801,7 @@ fn build_opts(
         } else {
             Vec::new()
         },
+        stt_fallback: s.get("sttFallback").and_then(|v| v.as_bool()).unwrap_or(true),
     }
 }
 

@@ -141,6 +141,7 @@ export function Settings() {
   const [useScribe, setUseScribe] = useState(false);
   const [elKeys, setElKeys] = useState<ElKey[]>([]);
   const [liveTranscript, setLiveTranscript] = useState(false);
+  const [sttFallback, setSttFallback] = useState(true);
   const [skipGpt, setSkipGpt] = useState(true); // AI Formatting off by default
   const [muteWhileRecording, setMuteWhileRecording] = useState(false);
   const [dictionary, setDictionary] = useState<DictEntry[]>([]);
@@ -219,6 +220,7 @@ export function Settings() {
       setUseScribe(s.useScribe ?? false);
       setElKeys(readElKeys(s));
       setLiveTranscript(s.liveTranscript ?? false);
+      setSttFallback(s.sttFallback ?? true);
       setSkipGpt(s.skipGpt ?? true);
       setMuteWhileRecording(s.muteWhileRecording ?? false);
       setDictionary(s.dictionary || []);
@@ -708,6 +710,23 @@ export function Settings() {
                               const v = !liveTranscript;
                               setLiveTranscript(v);
                               save({ liveTranscript: v }, v ? 'Live preview on' : 'Live preview off');
+                            }}
+                          />
+                        </div>
+
+                        <div className="flex items-center justify-between pt-1">
+                          <div className="pr-3">
+                            <Label>Fall back to Groq</Label>
+                            <HelpText>
+                              If every ElevenLabs key fails (credits gone, rate limit, blocked), the same recording is transcribed with Groq Whisper instead of being lost. Needs a Groq key under Transcription. Bangla accuracy is lower than Scribe.
+                            </HelpText>
+                          </div>
+                          <Toggle
+                            on={sttFallback}
+                            onClick={() => {
+                              const v = !sttFallback;
+                              setSttFallback(v);
+                              save({ sttFallback: v }, v ? 'Groq fallback on' : 'Groq fallback off');
                             }}
                           />
                         </div>

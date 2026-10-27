@@ -99,6 +99,8 @@ const api: Window['api'] = {
   onLivePartial: (cb) => sub('live:partial', cb),
   onLiveCommitted: (cb) => sub('live:committed', cb),
   onLiveError: (cb) => sub('live:error', cb),
+  onDictationNotice: (cb) => sub('dictation:notice', cb),
+  retryLast: () => invoke('retry_last'),
 
   // ── Live transcription (realtime STT) ──
   liveStart: (inputLang?: string) => invoke('live_start', { forceLang: inputLang }),
@@ -194,6 +196,9 @@ declare global {
       onLiveCommitted: (cb: (text: string) => void) => () => void;
       /** Terminal socket failure. The session is over — anything said after is lost. */
       onLiveError: (cb: (message: string) => void) => () => void;
+      /** A backend notice to show in the mic bar, e.g. a failed tray retry. */
+      onDictationNotice: (cb: (message: string) => void) => () => void;
+      retryLast: () => Promise<string>;
       liveStart: (inputLang?: string) => Promise<void>;
       livePush: (chunk: string) => Promise<void>;
       liveStop: (inputLang?: string, durationMs?: number) => Promise<string>;
