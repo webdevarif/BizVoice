@@ -97,14 +97,7 @@ pub struct LiveResult {
 /// Returning None lets the server auto-detect, which costs accuracy on short
 /// Bangla clips, so a known language is always worth passing.
 fn lang_code(lang: &str) -> Option<&'static str> {
-    match lang.to_lowercase().as_str() {
-        "bangla" | "bn" | "ben" | "banglish" => Some("ben"),
-        "english" | "en" | "eng" => Some("eng"),
-        "hindi" | "hi" | "hin" => Some("hin"),
-        "urdu" | "ur" | "urd" => Some("urd"),
-        "arabic" | "ar" | "ara" => Some("ara"),
-        _ => None,
-    }
+    crate::pipeline::scribe_lang(lang)
 }
 
 fn socket_url(lang: &str, vocabulary: &str) -> String {
@@ -112,12 +105,10 @@ fn socket_url(lang: &str, vocabulary: &str) -> String {
         "{WS_BASE}?model_id={MODEL}&audio_format=pcm_16000&commit_strategy=vad&vad_silence_threshold_secs={VAD_SILENCE_SECS}"
     );
     if let Some(code) = lang_code(lang) {
+        // No secondary_languages: with "eng" as secondary for Bangla, the model
+        // hedges on the first second of audio and emits it as Hindi
+        // (Devanagari). Bangla alone still keeps English words in Latin script.
         url.push_str(&format!("&language_code={code}"));
-        // Bangla dictation is habitually mixed with English technical words;
-        // naming the secondary language keeps identification from flip-flopping.
-        if code == "ben" {
-            url.push_str("&secondary_languages=eng");
-        }
     }
     // Realtime allows up to 50 keyterms of under 20 characters each.
     for t in crate::pipeline::vocab_terms(vocabulary, 20, 50) {
@@ -167,7 +158,7 @@ pub async fn start(
         )
         .await;
         match connect {
-            Ok(Ok((stream, _))) => return Ok(spawn_pump(app, stream, label.clone())),
+            Ok(Ok((stream, _))) => return Ok(spawn_pump(app, stream, label.clone(), input_lang.clone())),
             Ok(Err(e)) => {
                 let msg = e.to_string();
                 let kind = kh::classify_handshake(&msg);
@@ -223,7 +214,8 @@ fn chunk_frame(pcm: &[u8], commit: bool) -> String {
 /// unbounded channel goes out, transcripts come in and are emitted to the mic
 /// bar. The channel is unbounded on purpose: the audio callback must never
 /// block waiting on the network.
-fn spawn_pump(app: AppHandle, stream: Sock, label: String) -> LiveSession {
+fn spawn_pump(app: AppHandle, stream: Sock, label: String, lang: String) -> LiveSession {
+    let script = crate::pipeline::Script::of(&lang);
     let (mut writer, mut reader) = stream.split();
     let (audio_tx, mut audio_rx) = mpsc::unbounded_channel::<Out>();
 
@@ -304,9 +296,24 @@ fn spawn_pump(app: AppHandle, stream: Sock, label: String) -> LiveSession {
             match kind {
                 "session_started" => crate::keys::mark_good(&label),
                 "partial_transcript" => {
-                    let _ = app.emit_to("micbar", EV_PARTIAL, body);
+                    // A preview in the wrong script (Hindi for Bangla speech)
+                    // is a model hedge on too little audio. Hide it; the next
+                    // partial is usually right.
+                    if script.accepts(body) {
+                        let _ = app.emit_to("micbar", EV_PARTIAL, body);
+                    }
                 }
                 "committed_transcript" => {
+                    if !script.accepts(body) {
+                        // A final segment in the wrong script would be pasted
+                        // as-is. Mark the session for batch recovery instead
+                        // (batch pins language_code and sees all the audio).
+                        eprintln!("[live] committed text in wrong script, will re-transcribe");
+                        if let Ok(mut slot) = failure_in.lock() {
+                            slot.get_or_insert_with(|| "wrong script".to_string());
+                        }
+                        continue;
+                    }
                     if !body.trim().is_empty() {
                         if let Ok(mut c) = committed_in.lock() {
                             c.push(body.trim().to_string());
@@ -436,6 +443,9 @@ mod tests {
     fn keyterms_are_encoded_into_url() {
         let u = socket_url("bangla", "Next.js, Surfacly, a very long term that exceeds twenty");
         assert!(u.contains("language_code=ben"));
+        assert!(!u.contains("secondary_languages"));
+        assert!(socket_url("Spanish", "").contains("language_code=spa"));
+        assert!(!socket_url("auto", "").contains("language_code"));
         assert!(u.contains("&keyterms=Next.js"));
         assert!(u.contains("&keyterms=Surfacly"));
         assert!(!u.contains("exceeds"));

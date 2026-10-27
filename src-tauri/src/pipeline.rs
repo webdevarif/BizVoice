@@ -224,15 +224,99 @@ const EL_API: &str = "https://api.elevenlabs.io/v1";
 
 /// App language label / ISO-639-1 → ElevenLabs `language_code` (ISO-639-3).
 /// Scribe auto-detects, so this is only a hint and an unknown value is dropped.
-fn scribe_lang(lang: &str) -> Option<&'static str> {
-    match lang.to_lowercase().as_str() {
+pub(crate) fn scribe_lang(lang: &str) -> Option<&'static str> {
+    // Every language in the Settings dropdown. Anything unmapped would fall
+    // back to auto-detect, which for South Asian speech often picks Hindi.
+    Some(match lang.trim().to_lowercase().as_str() {
         // Banglish is spoken Bangla; gpt_refine romanizes it afterwards.
-        "bangla" | "bn" | "ben" | "banglish" => Some("ben"),
-        "english" | "en" | "eng" => Some("eng"),
-        "hindi" | "hi" | "hin" => Some("hin"),
-        "urdu" | "ur" | "urd" => Some("urd"),
-        "arabic" | "ar" | "ara" => Some("ara"),
-        _ => None,
+        "bangla" | "bengali" | "bn" | "ben" | "banglish" => "ben",
+        "english" | "en" | "eng" => "eng",
+        "hindi" | "hi" | "hin" => "hin",
+        "urdu" | "ur" | "urd" => "urd",
+        "arabic" | "ar" | "ara" => "ara",
+        "spanish" | "es" | "spa" => "spa",
+        "french" | "fr" | "fra" => "fra",
+        "german" | "de" | "deu" => "deu",
+        "italian" | "it" | "ita" => "ita",
+        "portuguese" | "pt" | "por" => "por",
+        "russian" | "ru" | "rus" => "rus",
+        "chinese" | "zh" | "zho" | "cmn" => "cmn",
+        "japanese" | "ja" | "jpn" => "jpn",
+        "korean" | "ko" | "kor" => "kor",
+        "turkish" | "tr" | "tur" => "tur",
+        "dutch" | "nl" | "nld" => "nld",
+        "polish" | "pl" | "pol" => "pol",
+        "vietnamese" | "vi" | "vie" => "vie",
+        _ => return None,
+    })
+}
+
+/// The writing system a dictation language is expected to come back in. Used
+/// to catch the model answering Bangla speech in Devanagari (Hindi).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Script {
+    Bengali,
+    Devanagari,
+    Arabic,
+    /// No check (Latin languages mix freely with English, or auto-detect).
+    Any,
+}
+
+impl Script {
+    pub fn of(lang: &str) -> Script {
+        match scribe_lang(lang) {
+            Some("ben") => Script::Bengali,
+            Some("hin") => Script::Devanagari,
+            Some("urd") | Some("ara") => Script::Arabic,
+            _ => Script::Any,
+        }
+    }
+
+    fn contains(self, c: char) -> bool {
+        match self {
+            Script::Bengali => ('\u{0980}'..='\u{09FF}').contains(&c),
+            Script::Devanagari => ('\u{0900}'..='\u{097F}').contains(&c),
+            Script::Arabic => ('\u{0600}'..='\u{06FF}').contains(&c) || ('\u{0750}'..='\u{077F}').contains(&c),
+            Script::Any => true,
+        }
+    }
+
+    /// True unless the text is mostly in a *different* South Asian / Arabic
+    /// script than expected. English (Latin) words are always fine, since
+    /// Bangla dictation is full of them.
+    pub fn accepts(self, text: &str) -> bool {
+        if self == Script::Any {
+            return true;
+        }
+        let others = [Script::Bengali, Script::Devanagari, Script::Arabic];
+        let foreign = text
+            .chars()
+            .filter(|&c| others.iter().any(|&o| o != self && o.contains(c)))
+            .count();
+        let own = text.chars().filter(|&c| self.contains(c)).count();
+        foreign == 0 || own > foreign * 4
+    }
+}
+
+#[cfg(test)]
+mod script_tests {
+    use super::*;
+
+    #[test]
+    fn bangla_rejects_devanagari_and_keeps_english() {
+        let s = Script::of("Bangla");
+        assert!(!s.accepts("अरे, जी, देखो।"));
+        assert!(s.accepts("আরে যে দেখো, এগুলা fix করা উচিত।"));
+        assert!(s.accepts("Next.js deploy done"));
+        assert!(s.accepts(""));
+    }
+
+    #[test]
+    fn unmapped_and_auto_accept_everything() {
+        assert!(Script::of("auto").accepts("अरे"));
+        assert!(Script::of("Spanish").accepts("hola अरे"));
+        assert_eq!(scribe_lang("Spanish"), Some("spa"));
+        assert_eq!(scribe_lang("auto"), None);
     }
 }
 
