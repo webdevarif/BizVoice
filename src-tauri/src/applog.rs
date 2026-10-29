@@ -43,7 +43,7 @@ pub fn write(line: &str) {
     }
 }
 
-fn timestamp() -> String {
+pub fn timestamp() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -80,6 +80,7 @@ pub fn install_panic_hook() {
             .or_else(|| info.payload().downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "unknown panic".into());
         write(&format!("[panic] {msg} at {loc}"));
+        crate::diag::append(serde_json::json!({"event": "panic", "message": msg, "at": loc}));
         default(info);
     }));
 }

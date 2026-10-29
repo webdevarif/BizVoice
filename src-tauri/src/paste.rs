@@ -265,7 +265,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         }
     } catch {
     } finally {
-        [Console]::Out.WriteLine("DONE")
+        [Console]::Out.WriteLine("DONE $proc $strategy")
         [Console]::Out.Flush()
     }
 }
@@ -348,16 +348,14 @@ fn send_line(app: &tauri::AppHandle, line: &str) -> bool {
     false
 }
 
-/// Wait until the worker reports the keystroke was sent. The first command
+/// Wait until the worker reports the keystroke was sent; returns its report
+/// ("DONE <process> <strategy>"). The first command
 /// after a (re)start includes compiling the C# helper (measured 5.7s on
 /// this machine), hence the long cap.
-fn wait_ack(app: &tauri::AppHandle, timeout: Duration) -> bool {
-    let Some(state) = app.try_state::<PasteWorker>() else { return false };
-    let Ok(g) = state.acks.lock() else { return false };
-    match g.as_ref() {
-        Some(rx) => rx.recv_timeout(timeout).is_ok(),
-        None => false,
-    }
+fn wait_ack(app: &tauri::AppHandle, timeout: Duration) -> Option<String> {
+    let state = app.try_state::<PasteWorker>()?;
+    let g = state.acks.lock().ok()?;
+    g.as_ref()?.recv_timeout(timeout).ok()
 }
 
 /// Stage `text` on the clipboard, then drive the resident worker to inject it
@@ -383,8 +381,18 @@ pub fn paste_text(app: &tauri::AppHandle, text: String) -> Result<(), String> {
     std::thread::spawn(move || {
         // Small delay lets the clipboard settle before the shortcut fires.
         std::thread::sleep(Duration::from_millis(40));
-        let sent = send_line(&app2, &format!("SMART:{b64}")) && wait_ack(&app2, Duration::from_secs(12));
-        if !sent {
+        let t0 = std::time::Instant::now();
+        let ack = if send_line(&app2, &format!("SMART:{b64}")) { wait_ack(&app2, Duration::from_secs(12)) } else { None };
+        let mut parts = ack.as_deref().unwrap_or("").split_whitespace().skip(1);
+        crate::diag::append(serde_json::json!({
+            "event": "paste",
+            "ok": ack.is_some(),
+            "target_process": parts.next().unwrap_or(""),
+            "strategy": parts.next().unwrap_or(""),
+            "ack_ms": t0.elapsed().as_millis() as u64,
+            "chars": text.chars().count(),
+        }));
+        if ack.is_none() {
             // The text is still on the clipboard, so nothing is lost.
             applog!("[paste] keystroke not confirmed; leaving text on clipboard");
             let _ = app2.emit_to("micbar", "dictation:notice", "Couldn't paste. The text is on your clipboard: press Ctrl+V.");

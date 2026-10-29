@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import Lenis from 'lenis';
 import ReactSelect, { type StylesConfig } from 'react-select';
 
-type Tab = 'overview' | 'history' | 'dictionary' | 'instructions' | 'general' | 'shortcuts' | 'languages' | 'audio' | 'appearance' | 'about';
+type Tab = 'overview' | 'history' | 'dictionary' | 'instructions' | 'general' | 'shortcuts' | 'languages' | 'audio' | 'appearance' | 'diagnostics' | 'about';
 type Lang = string;
 type DictEntry = { from: string; to: string; category?: string; ts?: number };
 type HistEntry = { text: string; ts: number; words: number; durationMs: number };
@@ -47,6 +47,7 @@ const NAV: { id: Tab; label: string; icon: JSX.Element }[] = [
   { id: 'languages',  label: 'Languages',  icon: ic(<><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></>) },
   { id: 'audio',      label: 'Audio',      icon: ic(<><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><line x1="12" y1="19" x2="12" y2="22"/></>) },
   { id: 'appearance', label: 'Appearance', icon: ic(<><circle cx="13.5" cy="6.5" r=".5"/><circle cx="17.5" cy="10.5" r=".5"/><circle cx="8.5" cy="7.5" r=".5"/><circle cx="6.5" cy="12.5" r=".5"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/></>) },
+  { id: 'diagnostics', label: 'Diagnostics', icon: ic(<><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></>) },
   { id: 'about',      label: 'About',      icon: ic(<><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></>) },
 ];
 
@@ -1290,6 +1291,8 @@ export function Settings() {
           )}
 
           {/* ── ABOUT ── */}
+          {tab === 'diagnostics' && <DiagnosticsTab save={save} flash={flash} />}
+
           {tab === 'about' && (
             <Section title="" description="">
               <Card>
@@ -1442,6 +1445,123 @@ function Select({ value, onChange, options, placeholder, isSearchable = false }:
       menuPortalTarget={typeof document !== 'undefined' ? document.body : undefined}
       styles={selectStyles}
     />
+  );
+}
+
+/**
+ * Diagnostics: fix the last dictation (teaches which words get mis-heard),
+ * vocabulary suggestions from repeated fixes, export for an AI agent, and an
+ * optional AI review of recent events.
+ */
+function DiagnosticsTab({ save, flash }: { save: (p: any, m?: string) => Promise<void>; flash: (k: 'ok' | 'err', m: string) => void }) {
+  const [original, setOriginal] = useState('');
+  const [fixed, setFixed] = useState('');
+  const [subs, setSubs] = useState<[string, string][] | null>(null);
+  const [sugg, setSugg] = useState<import('../lib/tauriApi').Suggestion[]>([]);
+  const [logText, setLogText] = useState(false);
+  const [busy, setBusy] = useState('');
+  const [report, setReport] = useState('');
+
+  useEffect(() => {
+    window.api.lastDictationText().then((t) => { setOriginal(t); setFixed(t); });
+    window.api.correctionSuggestions().then(setSugg);
+    window.api.getSettings().then((s: any) => setLogText(!!s.diagLogText));
+  }, []);
+
+  async function submit() {
+    if (!original.trim() || fixed.trim() === original.trim()) return;
+    const r = await window.api.submitCorrection(original, fixed);
+    setSubs(r.substitutions);
+    setSugg(r.suggestions);
+    setOriginal(fixed);
+    flash('ok', r.substitutions.length ? `Learned ${r.substitutions.length} fix(es)` : 'Saved');
+  }
+
+  async function accept(s: import('../lib/tauriApi').Suggestion) {
+    const cur: any = await window.api.getSettings();
+    const dict = Array.isArray(cur.dictionary) ? cur.dictionary : [];
+    const vocab: string = cur.vocabulary || '';
+    const hasTerm = vocab.split(/[,;\n]/).some((t) => t.trim().toLowerCase() === s.to.toLowerCase());
+    await save({
+      dictionary: dict.some((d: any) => d.from === s.from) ? dict : [...dict, { from: s.from, to: s.to, category: 'learned' }],
+      vocabulary: hasTerm ? vocab : (vocab.trim() ? `${vocab.trim()}, ${s.to}` : s.to),
+    }, `Added: ${s.from} → ${s.to}`);
+    await window.api.dismissSuggestion(s.key);
+    setSugg((x) => x.filter((y) => y.key !== s.key));
+  }
+
+  async function dismiss(s: import('../lib/tauriApi').Suggestion) {
+    await window.api.dismissSuggestion(s.key);
+    setSugg((x) => x.filter((y) => y.key !== s.key));
+  }
+
+  const btn = 'px-3 py-1.5 rounded-md text-[12px] font-semibold border border-white/15 text-white/80 hover:text-white hover:border-white/30 disabled:opacity-40';
+
+  return (
+    <Section title="Diagnostics" description="Help BizVoice learn your mistakes, and export what went wrong for an AI agent to read.">
+      <Card>
+        <Label>Fix last dictation</Label>
+        <HelpText>Correct the words that came out wrong. BizVoice records which words it mis-heard; a fix seen twice becomes a suggestion below.</HelpText>
+        {original ? (
+          <>
+            <textarea value={fixed} onChange={(e) => setFixed(e.target.value)} rows={4}
+              className="mt-2 w-full rounded-md bg-white/[0.04] border border-white/10 px-3 py-2 text-[13px] text-white/90 outline-none focus:border-white/25" />
+            <div className="mt-2 flex items-center gap-2">
+              <button className={btn} disabled={fixed.trim() === original.trim()} onClick={submit}>Save correction</button>
+              {subs && <span className="text-[11px] text-white/50">{subs.length ? subs.map(([a, b]) => `${a} → ${b}`).join(', ') : 'No word swaps found'}</span>}
+            </div>
+          </>
+        ) : <HelpText>No dictation yet in this session.</HelpText>}
+      </Card>
+
+      {sugg.length > 0 && (
+        <Card>
+          <Label>Suggested vocabulary</Label>
+          <HelpText>You fixed these more than once. Adding one puts it in the Dictionary (auto-replace) and sends the right word to the speech model as a key term.</HelpText>
+          <div className="mt-2 space-y-1.5">
+            {sugg.map((s) => (
+              <div key={s.key} className="flex items-center justify-between gap-2 text-[12px] text-white/80">
+                <span><span className="text-red-300/80">{s.from}</span> → <span className="text-green-300/90">{s.to}</span> <span className="text-white/40">({s.count}x)</span></span>
+                <span className="flex gap-1.5">
+                  <button className={btn} onClick={() => accept(s)}>Add</button>
+                  <button className={btn} onClick={() => dismiss(s)}>Ignore</button>
+                </span>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      <Card>
+        <div className="flex items-center justify-between">
+          <div className="pr-3">
+            <Label>Log dictated text</Label>
+            <HelpText>Off: the diagnostics log keeps only timings, errors and settings. On: it also keeps the text, which makes mis-hearings easier to find. Stays on this PC.</HelpText>
+          </div>
+          <Toggle on={logText} onClick={() => { const v = !logText; setLogText(v); save({ diagLogText: v }, v ? 'Text will be logged' : 'Text not logged'); }} />
+        </div>
+      </Card>
+
+      <Card>
+        <Label>Export for an AI agent</Label>
+        <HelpText>Makes a zip with the diagnostics log, error log, your corrections, settings without keys, and a README that explains the format. Give it to Claude or any agent.</HelpText>
+        <div className="mt-2 flex gap-2">
+          <button className={btn} disabled={!!busy} onClick={async () => {
+            setBusy('export');
+            try { const p = await window.api.exportDiagnostics(); flash('ok', 'Exported: ' + p.split(/[\\/]/).pop()); }
+            catch (e: any) { flash('err', typeof e === 'string' ? e : e?.message || 'Export failed'); }
+            setBusy('');
+          }}>{busy === 'export' ? 'Exporting…' : 'Export Diagnostics'}</button>
+          <button className={btn} disabled={!!busy} onClick={async () => {
+            setBusy('review'); setReport('');
+            try { setReport(await window.api.reviewDiagnostics()); }
+            catch (e: any) { flash('err', typeof e === 'string' ? e : e?.message || 'Review failed'); }
+            setBusy('');
+          }}>{busy === 'review' ? 'Reviewing…' : 'AI review (Groq)'}</button>
+        </div>
+        {report && <pre className="mt-3 whitespace-pre-wrap text-[12px] leading-relaxed text-white/80 bg-white/[0.03] rounded-md p-3 border border-white/10">{report}</pre>}
+      </Card>
+    </Section>
   );
 }
 

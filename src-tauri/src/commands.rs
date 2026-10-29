@@ -326,6 +326,8 @@ fn default_settings() -> Value {
         "sttFallback": true,
         // Scribe drops fillers (আ, um, আরকি) and false starts.
         "noVerbatim": true,
+        // Store dictated text in diagnostics.jsonl (off: metadata only).
+        "diagLogText": false,
         // The user's own ElevenLabs keys, tried in order with failover.
         "elevenlabsKeys": [],
         "scribeMigratedV2": false,
@@ -527,6 +529,7 @@ pub async fn live_stop(
         let wav = crate::realtime::pcm16_to_wav(&pcm);
         let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
         let dur = duration_ms.map(|d| d.max(0) as u64);
+        crate::diag::stash_live(&raw, failure.clone());
         match Box::pin(transcribe(app.clone(), b64, dur)).await {
             Ok(text) => return Ok(text),
             Err(e) if !raw.is_empty() && failure.is_none() => {
@@ -830,6 +833,14 @@ pub async fn transcribe(
         None
     };
 
+    let include_text = s.get("diagLogText").and_then(|v| v.as_bool()).unwrap_or(false);
+    crate::diag::begin(
+        "batch",
+        duration_ms.unwrap_or(0),
+        &opts.input_lang,
+        if local_path.is_some() { "local_whisper" } else if opts.use_scribe && !opts.elevenlabs_keys.is_empty() { "elevenlabs" } else { opts.stt_provider.as_str() },
+    );
+    let result: Result<String, String> = async {
     let text = if let Some(model_path) = local_path {
         use base64::Engine;
         let bytes = base64::engine::general_purpose::STANDARD
@@ -852,7 +863,13 @@ pub async fn transcribe(
     } else {
         crate::pipeline::run_pipeline(opts).await?
     };
-    let final_text = apply_dictionary(&text, &s);
+    Ok(apply_dictionary(&text, &s))
+    }.await;
+    crate::diag::finish(&result, include_text);
+    let final_text = result?;
+    if let Ok(mut l) = LAST_TEXT.lock() {
+        *l = final_text.clone();
+    }
 
     if !final_text.is_empty() {
         record_history(&app, &final_text, duration_ms.unwrap_or(0) as i64);
@@ -896,11 +913,96 @@ pub fn paste(app: tauri::AppHandle, text: String) -> Result<(), String> {
     crate::paste::paste_text(&app, text)
 }
 
+/// Text of the last dictation, for "Fix last".
+static LAST_TEXT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+#[tauri::command]
+pub fn last_dictation_text() -> String {
+    LAST_TEXT.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+/// The user's corrected version of the last dictation. Records which words
+/// were mis-heard; returns vocabulary suggestions for any fix seen 2+ times.
+#[tauri::command]
+pub fn submit_correction(original: String, corrected: String) -> Value {
+    let subs = crate::diag::record_correction(&original, &corrected);
+    serde_json::json!({ "substitutions": subs, "suggestions": correction_suggestions() })
+}
+
+#[tauri::command]
+pub fn correction_suggestions() -> Value {
+    let m = crate::diag::load_corrections();
+    let dismissed: Vec<String> = m.get("dismissed").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+    let mut out: Vec<(String, u64)> = m.get("pairs").and_then(|v| v.as_object()).map(|p| {
+        p.iter().filter_map(|(k, v)| { let n = v.as_u64()?; (n >= 2 && !dismissed.contains(k)).then(|| (k.clone(), n)) }).collect()
+    }).unwrap_or_default();
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    Value::Array(out.into_iter().map(|(k, n)| {
+        let (f, t) = k.split_once('\u{2192}').unwrap_or((&k, ""));
+        serde_json::json!({ "key": k, "from": f, "to": t, "count": n })
+    }).collect())
+}
+
+#[tauri::command]
+pub fn dismiss_suggestion(key: String) {
+    let mut m = crate::diag::load_corrections();
+    let d = m.entry("dismissed").or_insert_with(|| serde_json::json!([]));
+    if let Some(a) = d.as_array_mut() { a.push(serde_json::json!(key)); }
+    crate::diag::save_corrections(&m);
+}
+
+/// Zip of everything an AI agent needs to diagnose the app. Returns its path.
+#[tauri::command]
+pub fn export_diagnostics(app: tauri::AppHandle) -> Result<String, String> {
+    let p = crate::diag::export(&current_settings(&app))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("explorer.exe").arg(format!("/select,{}", p.display())).creation_flags(0x0800_0000).spawn();
+    }
+    Ok(p.display().to_string())
+}
+
+/// Ask the user's LLM to read recent diagnostics and write a short report.
+#[tauri::command]
+pub async fn review_diagnostics(app: tauri::AppHandle) -> Result<String, String> {
+    let s = current_settings(&app);
+    let key = decode_key(&s, "groqKeyEncrypted");
+    if key.is_empty() {
+        return Err("Add a Groq key (Settings > General) to use AI review.".into());
+    }
+    let lines = crate::diag::recent_lines(40);
+    if lines.is_empty() {
+        return Err("No diagnostics yet. Dictate a few times first.".into());
+    }
+    let prompt = format!("{}\n\nRecent diagnostics (JSONL, newest last):\n{}", crate::diag::REVIEW_PROMPT, lines.join("\n"));
+    let body = serde_json::json!({
+        "model": "llama-3.3-70b-versatile",
+        "temperature": 0.2,
+        "messages": [{"role": "user", "content": prompt}],
+    });
+    let resp = crate::pipeline::http()
+        .post("https://api.groq.com/openai/v1/chat/completions")
+        .bearer_auth(key)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(60))
+        .send().await.map_err(|e| format!("Could not reach Groq: {e}"))?;
+    let st = resp.status();
+    let v: Value = resp.json().await.map_err(|e| e.to_string())?;
+    if !st.is_success() {
+        return Err(format!("Groq {st}: {}", v.to_string().chars().take(200).collect::<String>()));
+    }
+    let report = v.pointer("/choices/0/message/content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+    crate::diag::append(serde_json::json!({"event": "ai_review", "report": report}));
+    Ok(report)
+}
+
 /// Errors shown in the mic bar, so they also end up in the log file.
 #[tauri::command]
 pub fn log_error(message: String) {
     let m: String = message.chars().take(500).collect();
     applog!("[ui] {m}");
+    crate::diag::append(serde_json::json!({"event": "ui_error", "message": m}));
 }
 
 const LAST_AUDIO_FILE: &str = "last-dictation.wav";
@@ -1063,10 +1165,11 @@ pub fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
     let retry = MenuItem::with_id(app, "retry_last", "Retry Last Dictation", true, None::<&str>)?;
     let open_log = MenuItem::with_id(app, "open_log", "Open Log", true, None::<&str>)?;
+    let export_diag = MenuItem::with_id(app, "export_diag", "Export Diagnostics", true, None::<&str>)?;
     let updates = MenuItem::with_id(app, "check_updates", "Check for Updates", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &retry, &settings, &open_log, &updates, &sep, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &retry, &settings, &open_log, &export_diag, &updates, &sep, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id("main-tray")
         .tooltip("BizVoice")
@@ -1096,6 +1199,11 @@ pub fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 pub fn handle_menu(app: &tauri::AppHandle, id: &str) {
     match id {
         "show_micbar" => show_micbar(app),
+        "export_diag" => {
+            if let Err(e) = export_diagnostics(app.clone()) {
+                applog!("[diag] export failed: {e}");
+            }
+        }
         "open_log" => {
             if let Some(p) = crate::applog::path() {
                 if !p.exists() {

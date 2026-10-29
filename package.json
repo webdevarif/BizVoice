@@ -1,6 +1,6 @@
 {
   "name": "bizvoice",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "AI voice typing for Windows — Whisper + GPT powered, works in any app",
   "author": "BizVoice",
   "license": "MIT",

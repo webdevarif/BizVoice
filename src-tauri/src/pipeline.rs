@@ -129,6 +129,8 @@ pub async fn run_pipeline(opts: PipelineOpts) -> Result<String, String> {
             // Groq Whisper when the user allows it and has a key.
             Err(e) if opts.stt_fallback && !opts.groq_key.is_empty() => {
                 applog!("[stt] scribe failed, falling back to Groq: {e}");
+                crate::diag::note("fallback", serde_json::json!("groq"));
+                crate::diag::note("fallback_reason", serde_json::json!(e.chars().take(200).collect::<String>()));
                 force_groq = true;
                 String::new()
             }
@@ -453,6 +455,30 @@ async fn scribe_attempt(
     }
 
     let data: Value = serde_json::from_str(&body).map_err(|e| (e.to_string(), Failure::Transient))?;
+    // Quality signal for diagnostics: words Scribe itself was unsure about.
+    if let Some(words) = data.get("words").and_then(|w| w.as_array()) {
+        let mut n = 0usize;
+        let mut low = Vec::new();
+        for w in words {
+            if w.get("type").and_then(|t| t.as_str()) != Some("word") {
+                continue;
+            }
+            n += 1;
+            let lp = w.get("logprob").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if lp < crate::diag::LOW_CONF_LOGPROB {
+                let t = w.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                low.push(serde_json::json!({"w": t, "p": ((lp.exp()) * 100.0).round() / 100.0}));
+            }
+        }
+        crate::diag::note("word_count_stt", serde_json::json!(n));
+        crate::diag::note("low_confidence_count", serde_json::json!(low.len()));
+        for l in low.into_iter().take(20) {
+            crate::diag::push("low_confidence", l);
+        }
+    }
+    if let Some(lc) = data.get("language_code").and_then(|v| v.as_str()) {
+        crate::diag::note("detected_lang", serde_json::json!(lc));
+    }
     Ok(data
         .get("text")
         .and_then(|v| v.as_str())
@@ -476,9 +502,16 @@ pub async fn scribe_stt(
     let mut last = "no ElevenLabs key configured".to_string();
 
     for (label, key) in keys::order(&opts.elevenlabs_keys) {
-        match scribe_attempt(client, key, audio, lang, &terms, opts.no_verbatim).await {
+        let t0 = std::time::Instant::now();
+        let res = scribe_attempt(client, key, audio, lang, &terms, opts.no_verbatim).await;
+        crate::diag::push("attempts", serde_json::json!({
+            "provider": "elevenlabs", "key": label, "ms": t0.elapsed().as_millis() as u64,
+            "ok": res.is_ok(), "failure": res.as_ref().err().map(|(_, k)| format!("{k:?}")),
+        }));
+        match res {
             Ok(text) => {
                 keys::mark_good(label);
+                crate::diag::note("stt_ms", serde_json::json!(t0.elapsed().as_millis() as u64));
                 return Ok(text);
             }
             Err((err, kind)) => {

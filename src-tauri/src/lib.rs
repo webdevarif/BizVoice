@@ -18,6 +18,7 @@
 #[macro_use]
 mod applog;
 mod commands;
+mod diag;
 mod keys;
 mod overlay;
 mod paste;
@@ -239,6 +240,12 @@ pub fn run() {
             commands::retry_last,
             commands::log_error,
             commands::set_mic_bar_expanded,
+            commands::last_dictation_text,
+            commands::submit_correction,
+            commands::correction_suggestions,
+            commands::dismiss_suggestion,
+            commands::export_diagnostics,
+            commands::review_diagnostics,
             // Local whisper models (Phase 4)
             commands::whisper_list_models,
             commands::whisper_download_model,

@@ -102,6 +102,12 @@ const api: Window['api'] = {
   onDictationNotice: (cb) => sub('dictation:notice', cb),
   retryLast: () => invoke('retry_last'),
   logError: (message: string) => invoke('log_error', { message }),
+  lastDictationText: () => invoke('last_dictation_text'),
+  submitCorrection: (original: string, corrected: string) => invoke('submit_correction', { original, corrected }),
+  correctionSuggestions: () => invoke('correction_suggestions'),
+  dismissSuggestion: (key: string) => invoke('dismiss_suggestion', { key }),
+  exportDiagnostics: () => invoke('export_diagnostics'),
+  reviewDiagnostics: () => invoke('review_diagnostics'),
   setMicBarExpanded: (expanded: boolean) => invoke('set_mic_bar_expanded', { expanded }),
 
   // ── Live transcription (realtime STT) ──
@@ -151,6 +157,8 @@ installTauriApi();
 
 // Mirror the preload's ambient type so the React code type-checks under the
 // Tauri build (where electron/preload/index.ts is not part of the program).
+export type Suggestion = { key: string; from: string; to: string; count: number };
+
 declare global {
   interface Window {
     api: {
@@ -202,6 +210,12 @@ declare global {
       onDictationNotice: (cb: (message: string) => void) => () => void;
       retryLast: () => Promise<string>;
       logError: (message: string) => Promise<void>;
+      lastDictationText: () => Promise<string>;
+      submitCorrection: (original: string, corrected: string) => Promise<{ substitutions: [string, string][]; suggestions: Suggestion[] }>;
+      correctionSuggestions: () => Promise<Suggestion[]>;
+      dismissSuggestion: (key: string) => Promise<void>;
+      exportDiagnostics: () => Promise<string>;
+      reviewDiagnostics: () => Promise<string>;
       setMicBarExpanded: (expanded: boolean) => Promise<void>;
       liveStart: (inputLang?: string) => Promise<void>;
       livePush: (chunk: string) => Promise<void>;
