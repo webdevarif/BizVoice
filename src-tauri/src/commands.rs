@@ -324,6 +324,8 @@ fn default_settings() -> Value {
         "useScribe": false,
         // Groq Whisper takes over when every ElevenLabs key fails.
         "sttFallback": true,
+        // Scribe drops fillers (আ, um, আরকি) and false starts.
+        "noVerbatim": true,
         // The user's own ElevenLabs keys, tried in order with failover.
         "elevenlabsKeys": [],
         "scribeMigratedV2": false,
@@ -507,24 +509,31 @@ pub async fn live_stop(
     // a *later* session and cutting that one short.
     let crate::realtime::LiveResult { text: raw, pcm, failure } = session.finish().await;
 
-    // The batch path is the safety net. Use it when the socket failed at any
-    // point (the committed text is then missing everything after the failure)
-    // or when it returned nothing for audio that is long enough to hold
-    // speech. Either way the whole session audio is transcribed again, on the
-    // next healthy key or the fallback provider, so no words are lost.
+    // The final text always comes from batch Scribe on the whole session
+    // audio. The realtime model is only the preview: on long Bangla
+    // dictation it invents phrases and loses VAD segments without reporting
+    // any error (a 69s test lost its second half), while batch on the same
+    // audio was complete and correct in ~4s. The live committed text is kept
+    // only as a last resort if batch fails on every key and provider.
     let min_speech_bytes = (crate::realtime::SAMPLE_RATE as usize) * 2 / 2; // 0.5s
-    if failure.is_some() || (raw.is_empty() && pcm.len() >= min_speech_bytes) {
-        if let Some(err) = &failure {
-            applog!("[live] socket failed ({err}); recovering via batch");
-        }
-        if pcm.len() < min_speech_bytes {
-            return Ok(String::new());
-        }
+    if let Some(err) = &failure {
+        applog!("[live] socket reported: {err}");
+    }
+    if pcm.len() < min_speech_bytes {
+        return Ok(String::new());
+    }
+    {
         use base64::Engine;
         let wav = crate::realtime::pcm16_to_wav(&pcm);
         let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
         let dur = duration_ms.map(|d| d.max(0) as u64);
-        return Box::pin(transcribe(app, b64, dur)).await;
+        match Box::pin(transcribe(app.clone(), b64, dur)).await {
+            Ok(text) => return Ok(text),
+            Err(e) if !raw.is_empty() && failure.is_none() => {
+                applog!("[live] batch final failed ({e}); using live text");
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     save_last_audio(&app, &crate::realtime::pcm16_to_wav(&pcm));
@@ -803,6 +812,7 @@ pub async fn transcribe(
         use_scribe: s.get("useScribe").and_then(|v| v.as_bool()).unwrap_or(false),
         elevenlabs_keys: decode_elevenlabs_keys(&s),
         stt_fallback: s.get("sttFallback").and_then(|v| v.as_bool()).unwrap_or(true),
+        no_verbatim: s.get("noVerbatim").and_then(|v| v.as_bool()).unwrap_or(true),
     };
 
     // Local whisper path: when enabled with a downloaded model, run STT via
@@ -1851,6 +1861,7 @@ fn build_opts(
             Vec::new()
         },
         stt_fallback: s.get("sttFallback").and_then(|v| v.as_bool()).unwrap_or(true),
+        no_verbatim: s.get("noVerbatim").and_then(|v| v.as_bool()).unwrap_or(true),
     }
 }
 

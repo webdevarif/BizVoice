@@ -32,6 +32,8 @@ pub struct PipelineOpts {
     /// When every ElevenLabs key fails, transcribe with Groq Whisper instead of
     /// failing the dictation (needs a Groq key).
     pub stt_fallback: bool,
+    /// Ask Scribe to drop fillers and false starts.
+    pub no_verbatim: bool,
 }
 
 /// One HTTP client for the whole app. Reusing it keeps TLS connections to the
@@ -397,6 +399,7 @@ async fn scribe_attempt(
     // request; every value comes from scribe_lang's fixed set of literals.
     lang: Option<&'static str>,
     keyterms: &[String],
+    no_verbatim: bool,
 ) -> Result<String, (String, crate::keys::Failure)> {
     use crate::keys::Failure;
     let part = reqwest::multipart::Part::bytes(audio.to_vec())
@@ -417,6 +420,9 @@ async fn scribe_attempt(
     // request, so they are only sent when the user has set some.
     for t in keyterms {
         form = form.text("keyterms", t.clone());
+    }
+    if no_verbatim {
+        form = form.text("no_verbatim", "true");
     }
 
     let resp = client
@@ -470,7 +476,7 @@ pub async fn scribe_stt(
     let mut last = "no ElevenLabs key configured".to_string();
 
     for (label, key) in keys::order(&opts.elevenlabs_keys) {
-        match scribe_attempt(client, key, audio, lang, &terms).await {
+        match scribe_attempt(client, key, audio, lang, &terms, opts.no_verbatim).await {
             Ok(text) => {
                 keys::mark_good(label);
                 return Ok(text);

@@ -142,6 +142,7 @@ export function Settings() {
   const [elKeys, setElKeys] = useState<ElKey[]>([]);
   const [liveTranscript, setLiveTranscript] = useState(false);
   const [sttFallback, setSttFallback] = useState(true);
+  const [noVerbatim, setNoVerbatim] = useState(true);
   const [skipGpt, setSkipGpt] = useState(true); // AI Formatting off by default
   const [muteWhileRecording, setMuteWhileRecording] = useState(false);
   const [dictionary, setDictionary] = useState<DictEntry[]>([]);
@@ -221,6 +222,7 @@ export function Settings() {
       setElKeys(readElKeys(s));
       setLiveTranscript(s.liveTranscript ?? false);
       setSttFallback(s.sttFallback ?? true);
+      setNoVerbatim(s.noVerbatim ?? true);
       setSkipGpt(s.skipGpt ?? true);
       setMuteWhileRecording(s.muteWhileRecording ?? false);
       setDictionary(s.dictionary || []);
@@ -701,7 +703,7 @@ export function Settings() {
                           <div className="pr-3">
                             <Label>Live preview</Label>
                             <HelpText>
-                              Shows words in the mic bar as you speak, instead of only after you stop. The text is still pasted once, at the end — formatting and Banglish work exactly as before. Uses more credits, since pauses are streamed too.
+                              Shows words in the mic bar as you speak. The pasted text still comes from a full transcription of the whole recording after you stop (more accurate), so this uses about twice the credits. Off is cheaper and just as accurate.
                             </HelpText>
                           </div>
                           <Toggle
@@ -710,6 +712,23 @@ export function Settings() {
                               const v = !liveTranscript;
                               setLiveTranscript(v);
                               save({ liveTranscript: v }, v ? 'Live preview on' : 'Live preview off');
+                            }}
+                          />
+                        </div>
+
+                        <div className="flex items-center justify-between pt-1">
+                          <div className="pr-3">
+                            <Label>Remove fillers</Label>
+                            <HelpText>
+                              Drops "আ", "um", "আরকি" and false starts from the transcript.
+                            </HelpText>
+                          </div>
+                          <Toggle
+                            on={noVerbatim}
+                            onClick={() => {
+                              const v = !noVerbatim;
+                              setNoVerbatim(v);
+                              save({ noVerbatim: v }, v ? 'Fillers removed' : 'Fillers kept');
                             }}
                           />
                         </div>

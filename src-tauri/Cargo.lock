@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "bizvoice"
-version = "0.1.27"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
