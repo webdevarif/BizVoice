@@ -124,6 +124,11 @@ pub fn push(key: &str, v: Value) {
     }
 }
 
+/// Fallback provider used in the current dictation, if any.
+pub fn current_fallback() -> Option<String> {
+    CUR.lock().ok()?.as_ref()?.rec.get("fallback")?.as_str().map(String::from)
+}
+
 /// Close the current record and write it.
 pub fn finish(result: &Result<String, String>, include_text: bool) {
     let Some(mut cur) = CUR.lock().ok().and_then(|mut c| c.take()) else { return };

@@ -110,6 +110,8 @@ export function Settings() {
   const [hasKey, setHasKey] = useState(false);
   const [groqKey, setGroqKey] = useState('');
   const [hasGroqKey, setHasGroqKey] = useState(false);
+  const [geminiKey, setGeminiKey] = useState('');
+  const [hasGeminiKey, setHasGeminiKey] = useState(false);
   const [hotkey, setHotkey] = useState('CommandOrControl+Shift+Space');
   const [pttHotkey, setPttHotkey] = useState('CommandOrControl+Space');
   const [inputLang, setInputLang] = useState<Lang>('auto');
@@ -231,6 +233,8 @@ export function Settings() {
       setWidgetStyle(s.widgetStyle || 'logoText');
       setInstructions(s.instructions || '');
       setHasGroqKey(!!s.hasGroqKey);
+      setHasGeminiKey(!!s.hasGeminiKey);
+      if (s.hasGeminiKey) setGeminiKey('••••••••••••••••••••');
       if (s.hasGroqKey) setGroqKey('••••••••••••••••••••');
       setHasKey(s.hasKey);
       if (s.hasKey) setApiKey('••••••••••••••••••••');
@@ -430,6 +434,13 @@ export function Settings() {
     await save({ openaiKey: t }, 'API key saved');
     setHasKey(true); setApiKey('••••••••••••••••••••');
   }
+  async function saveGeminiKey() {
+    const t = geminiKey.trim();
+    if (!t || t.startsWith('•')) return;
+    await save({ geminiKey: t } as any, 'Gemini key saved');
+    setHasGeminiKey(true); setGeminiKey('••••••••••••••••••••');
+  }
+
   async function saveGroqKey() {
     const t = groqKey.trim();
     if (!t || t.startsWith('•')) { flash('err', 'Please enter a key'); return; }
@@ -715,6 +726,14 @@ export function Settings() {
                               save({ liveTranscript: v }, v ? 'Live preview on' : 'Live preview off');
                             }}
                           />
+                        </div>
+
+                        <div className="pt-1">
+                          <HelpText>
+                            Backup when every ElevenLabs key is out of credits. Gemini writes Bangla well; Groq Whisper is the last resort. Free key: aistudio.google.com/apikey
+                          </HelpText>
+                          <KeyCard label="Gemini API Key (backup)" has={hasGeminiKey} val={geminiKey} setVal={setGeminiKey} onSave={saveGeminiKey} prefix="AIza"
+                            onChange={() => setGeminiKey('')} onRemove={() => { save({ geminiKey: '' } as any, 'Key removed'); setHasGeminiKey(false); setGeminiKey(''); }} />
                         </div>
 
                         <div className="flex items-center justify-between pt-1">

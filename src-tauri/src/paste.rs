@@ -265,7 +265,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         }
     } catch {
     } finally {
-        [Console]::Out.WriteLine("DONE $proc $strategy")
+        [Console]::Out.WriteLine("DONE|$proc|$strategy")
         [Console]::Out.Flush()
     }
 }
@@ -349,7 +349,7 @@ fn send_line(app: &tauri::AppHandle, line: &str) -> bool {
 }
 
 /// Wait until the worker reports the keystroke was sent; returns its report
-/// ("DONE <process> <strategy>"). The first command
+/// ("DONE|<process>|<strategy>"). The first command
 /// after a (re)start includes compiling the C# helper (measured 5.7s on
 /// this machine), hence the long cap.
 fn wait_ack(app: &tauri::AppHandle, timeout: Duration) -> Option<String> {
@@ -383,7 +383,8 @@ pub fn paste_text(app: &tauri::AppHandle, text: String) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(40));
         let t0 = std::time::Instant::now();
         let ack = if send_line(&app2, &format!("SMART:{b64}")) { wait_ack(&app2, Duration::from_secs(12)) } else { None };
-        let mut parts = ack.as_deref().unwrap_or("").split_whitespace().skip(1);
+        // "DONE|<process>|<strategy>"; process may be empty, so split on '|'.
+        let mut parts = ack.as_deref().unwrap_or("").split('|').skip(1);
         crate::diag::append(serde_json::json!({
             "event": "paste",
             "ok": ack.is_some(),

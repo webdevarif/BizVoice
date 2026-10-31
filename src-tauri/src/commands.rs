@@ -111,17 +111,20 @@ fn add_key_flags(s: &mut Value) {
     // rather than the row count, so a row the user added but never saved
     // doesn't make the mic bar think it's ready.
     let has_eleven = !decode_elevenlabs_keys(s).is_empty();
+    let has_gemini = s.get("geminiKeyEncrypted").and_then(|v| v.as_str()).map_or(false, |v| !v.is_empty());
 
     if let Some(o) = s.as_object_mut() {
         o.insert("hasKey".into(), Value::Bool(has_key));
         o.insert("hasGroqKey".into(), Value::Bool(has_groq));
+        o.insert("hasGeminiKey".into(), Value::Bool(has_gemini));
         o.insert("hasOpenrouterKey".into(), Value::Bool(has_or));
         o.insert("hasCustomKey".into(), Value::Bool(has_custom));
         o.insert("hasElevenlabsKeys".into(), Value::Bool(has_eleven));
     }
 }
 
-const KEY_FIELDS: [(&str, &str); 4] = [
+const KEY_FIELDS: [(&str, &str); 5] = [
+    ("geminiKey", "geminiKeyEncrypted"),
     ("openaiKey", "openaiKeyEncrypted"),
     ("groqKey", "groqKeyEncrypted"),
     ("openrouterKey", "openrouterKeyEncrypted"),
@@ -816,6 +819,7 @@ pub async fn transcribe(
         elevenlabs_keys: decode_elevenlabs_keys(&s),
         stt_fallback: s.get("sttFallback").and_then(|v| v.as_bool()).unwrap_or(true),
         no_verbatim: s.get("noVerbatim").and_then(|v| v.as_bool()).unwrap_or(true),
+        gemini_key: decode_key(&s, "geminiKeyEncrypted"),
     };
 
     // Local whisper path: when enabled with a downloaded model, run STT via
@@ -865,6 +869,23 @@ pub async fn transcribe(
     };
     Ok(apply_dictionary(&text, &s))
     }.await;
+    if let (Some(fb), Ok(t)) = (crate::diag::current_fallback(), &result) {
+        if !t.is_empty() {
+            use tauri::Emitter;
+            let msg = if fb == "groq" {
+                "ElevenLabs credits are used up, so Groq Whisper wrote this. Its Bangla is weak: check the text, or add a Gemini key / new ElevenLabs key in Settings."
+            } else {
+                "ElevenLabs credits are used up, so Gemini wrote this. Add a new ElevenLabs key in Settings for the best accuracy."
+            };
+            // After the mic bar has pasted and gone idle, or its state change
+            // would hide the card straight away.
+            let app2 = app.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                let _ = app2.emit_to("micbar", "dictation:notice", msg);
+            });
+        }
+    }
     crate::diag::finish(&result, include_text);
     let final_text = result?;
     if let Ok(mut l) = LAST_TEXT.lock() {
@@ -1970,6 +1991,7 @@ fn build_opts(
         },
         stt_fallback: s.get("sttFallback").and_then(|v| v.as_bool()).unwrap_or(true),
         no_verbatim: s.get("noVerbatim").and_then(|v| v.as_bool()).unwrap_or(true),
+        gemini_key: decode_key(&s, "geminiKeyEncrypted"),
     }
 }
 

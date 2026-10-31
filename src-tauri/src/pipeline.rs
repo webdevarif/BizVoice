@@ -34,6 +34,8 @@ pub struct PipelineOpts {
     pub stt_fallback: bool,
     /// Ask Scribe to drop fillers and false starts.
     pub no_verbatim: bool,
+    /// Google AI Studio key: first fallback when Scribe fails (good Bangla).
+    pub gemini_key: String,
 }
 
 /// One HTTP client for the whole app. Reusing it keeps TLS connections to the
@@ -125,6 +127,28 @@ pub async fn run_pipeline(opts: PipelineOpts) -> Result<String, String> {
     if opts.use_scribe && !opts.elevenlabs_keys.is_empty() {
         let raw = match scribe_stt(client, &opts, &bytes).await {
             Ok(t) => t,
+            // Gemini first: it handles Bangla far better than Whisper, which
+            // returns phonetic gibberish for long Bangla speech.
+            Err(e) if opts.stt_fallback && !opts.gemini_key.is_empty() => {
+                applog!("[stt] scribe failed, falling back to Gemini: {e}");
+                crate::diag::note("fallback", serde_json::json!("gemini"));
+                crate::diag::note("fallback_reason", serde_json::json!(e.chars().take(200).collect::<String>()));
+                let t0 = std::time::Instant::now();
+                match gemini_stt(client, &opts, &bytes).await {
+                    Ok(t) => {
+                        crate::diag::note("stt_ms", serde_json::json!(t0.elapsed().as_millis() as u64));
+                        t
+                    }
+                    Err(ge) if !opts.groq_key.is_empty() => {
+                        applog!("[stt] gemini failed, falling back to Groq: {ge}");
+                        crate::diag::note("fallback", serde_json::json!("groq"));
+                        crate::diag::note("gemini_error", serde_json::json!(ge.chars().take(200).collect::<String>()));
+                        force_groq = true;
+                        String::new()
+                    }
+                    Err(ge) => return Err(format!("{e} Gemini fallback failed too: {ge}")),
+                }
+            }
             // Every key failed. Rather than lose the dictation, fall back to
             // Groq Whisper when the user allows it and has a key.
             Err(e) if opts.stt_fallback && !opts.groq_key.is_empty() => {
@@ -386,6 +410,51 @@ pub async fn probe_elevenlabs_key(key: &str) -> Value {
         "charsUsed": data.get("character_count").and_then(|v| v.as_u64()),
         "charsLimit": data.get("character_limit").and_then(|v| v.as_u64()),
     })
+}
+
+const GEMINI_MODEL: &str = "gemini-2.5-flash";
+
+/// Transcribe with Gemini (audio understanding). Used only as a fallback.
+pub async fn gemini_stt(client: &reqwest::Client, opts: &PipelineOpts, audio: &[u8]) -> Result<String, String> {
+    use base64::Engine;
+    let lang = match opts.input_lang.to_lowercase().as_str() {
+        "auto" | "" => "the spoken language".to_string(),
+        "banglish" => "Bangla".to_string(),
+        l => { let mut c = l.chars(); c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default() }
+    };
+    let terms = vocab_terms(&opts.vocabulary, 50, 100);
+    let mut prompt = format!(
+        "Transcribe this audio exactly as spoken. The speaker uses {lang}; write {lang} words in their native script and keep English words that are spoken in English in Latin letters. Drop filler sounds (um, আ). Output only the transcript, no notes, no quotes."
+    );
+    if !terms.is_empty() {
+        prompt += &format!(" These names may appear, spell them like this: {}.", terms.join(", "));
+    }
+    let body = serde_json::json!({
+        "contents": [{"parts": [
+            {"inline_data": {"mime_type": "audio/wav", "data": base64::engine::general_purpose::STANDARD.encode(audio)}},
+            {"text": prompt}
+        ]}],
+        "generationConfig": {"temperature": 0, "thinkingConfig": {"thinkingBudget": 0}}
+    });
+    let resp = client
+        .post(format!("https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"))
+        .header("x-goog-api-key", &opts.gemini_key)
+        .json(&body)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .map_err(|e| format!("Could not reach Gemini: {e}"))?;
+    let st = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !st.is_success() {
+        return Err(format!("Gemini {st}: {}", text.chars().take(200).collect::<String>()));
+    }
+    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let out = v.pointer("/candidates/0/content/parts")
+        .and_then(|p| p.as_array())
+        .map(|a| a.iter().filter_map(|x| x.get("text").and_then(|t| t.as_str())).collect::<String>())
+        .unwrap_or_default();
+    Ok(out.trim().to_string())
 }
 
 /// Scribe batch model. v2 is the current model: better accuracy and the only
