@@ -168,6 +168,8 @@ declare global {
         ok: boolean;
         /** Key authenticated but its scope hides the balance. */
         restricted?: boolean;
+        /** Last real request hit this account's quota. */
+        spent?: boolean;
         note?: string;
         tier?: string;
         charsUsed?: number | null;

@@ -164,7 +164,17 @@ pub fn order<'a>(keys: &'a [(String, String)]) -> Vec<&'a (String, String)> {
         Some(h) => (h.last_good.clone(), h.resting.clone()),
         None => (None, HashMap::new()),
     };
-    order_with(keys, last_good.as_deref(), &resting, now)
+    let mut out = order_with(keys, last_good.as_deref(), &resting, now);
+    // After a restart the in-memory cool-downs are gone, so every dictation
+    // used to try each spent key first (6 keys = ~10s of 401s). Keys whose
+    // last real request hit the quota go last; they are still tried, so a
+    // refilled account recovers on its own.
+    let usage = load_usage();
+    let spent = |l: &str| {
+        usage.get(&mask_of(l)).and_then(|u| u.get("state")).and_then(|s| s.as_str()).map_or(false, |s| s == "quota" || s == "flagged")
+    };
+    out.sort_by_key(|(l, _)| spent(l));
+    out
 }
 
 fn order_with<'a>(
@@ -286,5 +296,75 @@ mod tests {
         let keys = k(&["a", "b"]);
         let resting = HashMap::new();
         assert_eq!(labels(order_with(&keys, Some("gone"), &resting, Instant::now())), ["a", "b"]);
+    }
+}
+
+// ── Last known usage per key, kept across restarts ─────────────────────────
+//
+// Keys made without the "User: Read" scope cannot report their balance, so
+// the Settings "Test" button could only say "Valid key" even for a spent
+// account. Every real request tells us more: a quota error carries "You have
+// N credits remaining". That is stored here per masked key, so Settings can
+// show "Out of credits (2 left)" next to the right row.
+
+fn usage_path() -> Option<std::path::PathBuf> {
+    Some(std::path::PathBuf::from(std::env::var_os("APPDATA")?).join("com.bizvoice.app").join("key-usage.json"))
+}
+
+/// "key 3 (sk_3••••••f37d)" -> "sk_3••••••f37d"
+pub fn mask_of(label: &str) -> String {
+    match (label.find('('), label.rfind(')')) {
+        (Some(a), Some(b)) if b > a => label[a + 1..b].to_string(),
+        _ => label.to_string(),
+    }
+}
+
+/// "…You have 4 credits remaining…" -> Some(4)
+pub fn remaining_credits(msg: &str) -> Option<u64> {
+    let i = msg.find("You have ")? + "You have ".len();
+    let rest = &msg[i..];
+    let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !rest[num.len()..].trim_start().starts_with("credits remaining") {
+        return None;
+    }
+    num.parse().ok()
+}
+
+pub fn load_usage() -> serde_json::Map<String, serde_json::Value> {
+    usage_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// Record the outcome of a real request with this key.
+pub fn record_usage(label: &str, failure: Option<Failure>, msg: &str) {
+    let Some(p) = usage_path() else { return };
+    let mut m = load_usage();
+    let state = match failure {
+        None => "ok",
+        Some(Failure::Quota) => "quota",
+        Some(Failure::Auth) => "auth",
+        Some(Failure::Flagged) => "flagged",
+        Some(Failure::RateLimited) => "rate_limited",
+        Some(_) => return, // transient errors say nothing about the key
+    };
+    let mut e = serde_json::json!({ "state": state, "at": crate::applog::timestamp() });
+    if let Some(n) = remaining_credits(msg) {
+        e["remaining"] = serde_json::json!(n);
+    }
+    m.insert(mask_of(label), e);
+    let _ = std::fs::write(p, serde_json::to_string_pretty(&serde_json::Value::Object(m)).unwrap_or_default());
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    #[test]
+    fn parses_remaining() {
+        assert_eq!(remaining_credits("exceeds your quota of 10000. You have 4 credits remaining, while 12"), Some(4));
+        assert_eq!(remaining_credits("You have exceeded your quota."), None);
+        assert_eq!(mask_of("key 3 (sk_3••••••f37d)"), "sk_3••••••f37d");
     }
 }

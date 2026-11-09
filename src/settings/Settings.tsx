@@ -405,6 +405,7 @@ export function Settings() {
       updateElKey(id, {
         testing: false,
         status: res.ok ? 'ok' : 'fail',
+        spent: !!res.spent,
         error: res.ok ? undefined : res.error,
         note: res.note,
         tier: res.tier,
@@ -696,6 +697,16 @@ export function Settings() {
                         {elKeys.length === 0 && (
                           <div className="text-[11px] text-amber-400/80">
                             No key yet — premium transcription can't run until you add one.
+                          </div>
+                        )}
+
+                        {elKeys.some((r) => r.spent) && (
+                          <div className="flex items-center justify-between gap-2 rounded-md border border-amber-400/20 bg-amber-400/[0.05] px-3 py-2 text-[11px] text-amber-300/90">
+                            <span>{elKeys.filter((r) => r.spent).length} key(s) are out of credits. BizVoice skips them, but they slow each dictation down.</span>
+                            <button
+                              className="shrink-0 px-2 py-1 rounded border border-amber-400/30 hover:border-amber-400/60"
+                              onClick={() => persistElKeys(elKeys.filter((r) => !r.spent), 'Removed spent keys')}
+                            >Remove spent keys</button>
                           </div>
                         )}
 
@@ -1614,6 +1625,8 @@ interface ElKey {
   tier?: string;
   charsUsed?: number;
   charsLimit?: number;
+  /** Last real request said this account is out of credits. */
+  spent?: boolean;
 }
 
 /** Read the key list out of a settings payload, tolerating an absent/legacy field. */

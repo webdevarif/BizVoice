@@ -425,7 +425,35 @@ pub async fn test_elevenlabs_key(app: tauri::AppHandle, id: String) -> Result<Va
         return Ok(json!({ "ok": false, "error": "No key saved for this row" }));
     }
 
-    Ok(crate::pipeline::probe_elevenlabs_key(&key).await)
+    let mut res = crate::pipeline::probe_elevenlabs_key(&key).await;
+    // A scope-restricted key can't show its balance, so add what the last
+    // real dictation learned about it (see keys::record_usage).
+    if res.get("restricted").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if let Some(u) = crate::keys::load_usage().get(&mask_key(&key)) {
+            let at = u.get("at").and_then(|v| v.as_str()).unwrap_or("");
+            let left = u.get("remaining").and_then(|v| v.as_u64());
+            match u.get("state").and_then(|v| v.as_str()) {
+                Some("quota") => {
+                    res = json!({
+                        "ok": false,
+                        "spent": true,
+                        "error": match left {
+                            Some(n) => format!("Out of credits: {n} left (seen {at}). Too few for a dictation."),
+                            None => format!("Out of credits (seen {at})."),
+                        },
+                    });
+                }
+                Some("flagged") => {
+                    res = json!({ "ok": false, "spent": true, "error": format!("ElevenLabs blocked this free account for unusual activity (seen {at}).") });
+                }
+                Some("ok") => {
+                    res["note"] = json!(format!("Valid key. Last dictation with it worked ({at}). Credits hidden: enable \"User: Read\" to see the balance."));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(res)
 }
 
 // ── Live transcription (Mode 1: preview) ────────────────────────────────────

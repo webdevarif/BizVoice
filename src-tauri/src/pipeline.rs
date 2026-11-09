@@ -580,12 +580,14 @@ pub async fn scribe_stt(
         match res {
             Ok(text) => {
                 keys::mark_good(label);
+                keys::record_usage(label, None, "");
                 crate::diag::note("stt_ms", serde_json::json!(t0.elapsed().as_millis() as u64));
                 return Ok(text);
             }
             Err((err, kind)) => {
                 applog!("[stt] scribe key {label:?} failed ({kind:?}): {err}");
                 keys::mark_bad(label, kind);
+                keys::record_usage(label, Some(kind), &err);
                 worst = Some(keys::worst(worst, kind));
                 last = format!("{label}: {err}");
                 if !kind.try_next_key() {
