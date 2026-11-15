@@ -308,7 +308,7 @@ mod tests {
 // show "Out of credits (2 left)" next to the right row.
 
 fn usage_path() -> Option<std::path::PathBuf> {
-    Some(std::path::PathBuf::from(std::env::var_os("APPDATA")?).join("com.bizvoice.app").join("key-usage.json"))
+    crate::applog::data_dir().map(|d| d.join("key-usage.json"))
 }
 
 /// "key 3 (sk_3••••••f37d)" -> "sk_3••••••f37d"

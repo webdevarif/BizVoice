@@ -4,7 +4,7 @@
 // A release build has no console, so eprintln! output was simply lost, and a
 // failed dictation or a crash left no trace. Everything that used eprintln!
 // now goes through `applog!`, which still prints in dev and also appends a
-// timestamped line to %APPDATA%/com.bizvoice.app/bizvoice.log. The file is
+// timestamped line to bizvoice.log in the app data folder (see data_dir). The file is
 // trimmed to its last ~200 KB when it passes 1 MB.
 
 use std::io::Write;
@@ -18,11 +18,26 @@ const KEEP_BYTES: usize = 200_000;
 
 static LOCK: Mutex<()> = Mutex::new(());
 
-/// Resolved without a Tauri handle so the panic hook can use it before (and
-/// after) the app exists. Matches app_data_dir() for this identifier.
+/// The app's data folder, resolved without a Tauri handle so the panic hook
+/// can use it before (and after) the app exists. Matches Tauri's
+/// app_data_dir() for this identifier on each OS:
+/// Windows %APPDATA%\com.bizvoice.app, macOS ~/Library/Application Support/
+/// com.bizvoice.app, Linux $XDG_DATA_HOME (or ~/.local/share)/com.bizvoice.app.
+pub fn data_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let base = PathBuf::from(std::env::var_os("APPDATA")?);
+    #[cfg(target_os = "macos")]
+    let base = PathBuf::from(std::env::var_os("HOME")?).join("Library").join("Application Support");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let base = match std::env::var_os("XDG_DATA_HOME") {
+        Some(x) => PathBuf::from(x),
+        None => PathBuf::from(std::env::var_os("HOME")?).join(".local").join("share"),
+    };
+    Some(base.join(APP_DIR))
+}
+
 pub fn path() -> Option<PathBuf> {
-    let base = std::env::var_os("APPDATA")?;
-    Some(PathBuf::from(base).join(APP_DIR).join(FILE))
+    data_dir().map(|d| d.join(FILE))
 }
 
 pub fn write(line: &str) {

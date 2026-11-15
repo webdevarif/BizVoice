@@ -962,6 +962,22 @@ pub fn paste(app: tauri::AppHandle, text: String) -> Result<(), String> {
     crate::paste::paste_text(&app, text)
 }
 
+/// Called when a recording starts. On macOS, pasting needs the Accessibility
+/// permission; asking at the start of the first dictation (not at launch)
+/// gives the user the length of the recording to allow it, so that very
+/// dictation can still paste. Always true on other platforms.
+#[tauri::command]
+pub fn ensure_paste_permission() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::accessibility_trusted(false) || crate::macos::accessibility_trusted(true)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
 /// Text of the last dictation, for "Fix last".
 static LAST_TEXT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
@@ -1009,6 +1025,9 @@ pub fn export_diagnostics(app: tauri::AppHandle) -> Result<String, String> {
         use std::os::windows::process::CommandExt;
         let _ = std::process::Command::new("explorer.exe").arg(format!("/select,{}", p.display())).creation_flags(0x0800_0000).spawn();
     }
+    // Reveal the zip in Finder.
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("/usr/bin/open").arg("-R").arg(&p).spawn();
     Ok(p.display().to_string())
 }
 
@@ -1266,6 +1285,9 @@ pub fn handle_menu(app: &tauri::AppHandle, id: &str) {
                         .creation_flags(0x0800_0000)
                         .spawn();
                 }
+                // -t: open in the default text editor (TextEdit).
+                #[cfg(target_os = "macos")]
+                let _ = std::process::Command::new("/usr/bin/open").arg("-t").arg(&p).spawn();
             }
         }
         "retry_last" => {

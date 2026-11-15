@@ -1,3 +1,7 @@
+#![cfg_attr(target_os = "macos", allow(dead_code, unused_imports))]
+// (The PowerShell worker below is the Windows path; macOS pastes through
+// crate::macos::cmd_v and never starts it.)
+
 // Phase 4: Windows text-injection — ported from electron/main/index.ts.
 //
 // A long-lived PowerShell worker hosts a `Typer` C# class (SendInput + foreground
@@ -274,6 +278,12 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
 /// Spawn the resident PowerShell typing worker if it isn't already running.
 /// Mirrors `ensureTypeProc()` in index.ts — writes the script to a temp file and
 /// spawns a hidden long-lived process with a piped stdin.
+#[cfg(target_os = "macos")]
+pub fn ensure_worker(_app: &tauri::AppHandle) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn ensure_worker(app: &tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<PasteWorker>();
     let mut child_guard = state.child.lock().map_err(|_| "paste lock poisoned")?;
@@ -382,7 +392,7 @@ pub fn paste_text(app: &tauri::AppHandle, text: String) -> Result<(), String> {
         // Small delay lets the clipboard settle before the shortcut fires.
         std::thread::sleep(Duration::from_millis(40));
         let t0 = std::time::Instant::now();
-        let ack = if send_line(&app2, &format!("SMART:{b64}")) { wait_ack(&app2, Duration::from_secs(12)) } else { None };
+        let ack = inject(&app2, &b64);
         // "DONE|<process>|<strategy>"; process may be empty, so split on '|'.
         let mut parts = ack.as_deref().unwrap_or("").split('|').skip(1);
         crate::diag::append(serde_json::json!({
@@ -396,7 +406,7 @@ pub fn paste_text(app: &tauri::AppHandle, text: String) -> Result<(), String> {
         if ack.is_none() {
             // The text is still on the clipboard, so nothing is lost.
             applog!("[paste] keystroke not confirmed; leaving text on clipboard");
-            let _ = app2.emit_to("micbar", "dictation:notice", "Couldn't paste. The text is on your clipboard: press Ctrl+V.");
+            let _ = app2.emit_to("micbar", "dictation:notice", PASTE_FAILED_HINT);
             return;
         }
         // The target app reads the clipboard asynchronously after the
@@ -411,6 +421,36 @@ pub fn paste_text(app: &tauri::AppHandle, text: String) -> Result<(), String> {
         }
     });
     Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+const PASTE_FAILED_HINT: &str = "Couldn't paste. The text is on your clipboard: press Ctrl+V.";
+#[cfg(target_os = "macos")]
+const PASTE_FAILED_HINT: &str = "Couldn't paste: allow BizVoice in System Settings > Privacy & Security > Accessibility. The text is on your clipboard: press Cmd+V.";
+
+/// Send the paste keystroke. Some("DONE|<process>|<strategy>") once sent.
+#[cfg(not(target_os = "macos"))]
+fn inject(app: &tauri::AppHandle, b64: &str) -> Option<String> {
+    if send_line(app, &format!("SMART:{b64}")) {
+        wait_ack(app, Duration::from_secs(12))
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn inject(_app: &tauri::AppHandle, _b64: &str) -> Option<String> {
+    match crate::macos::cmd_v() {
+        Ok(()) => Some("DONE||cmd-v".into()),
+        Err(e) => {
+            applog!("[paste] macOS paste failed: {e}");
+            if e == "accessibility" {
+                // Show the system prompt so the next dictation works.
+                crate::macos::accessibility_trusted(true);
+            }
+            None
+        }
+    }
 }
 
 /// Kill the resident worker (called on app exit — mirrors index.ts `before-quit`).

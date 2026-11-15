@@ -675,6 +675,9 @@ export function MicBar() {
     startingRef.current = true;
     try {
       if (errTimerRef.current) clearError(); else setError('');
+      // macOS: shows the Accessibility prompt on the first dictation, while
+      // there is still time to allow it before this recording pastes.
+      void window.api.ensurePastePermission?.();
       const s = await window.api.getSettings();
       // Live preview needs premium Scribe and a key. Local mode wins over it,
       // exactly as it does on the batch path (transcribe resolves the on-device
