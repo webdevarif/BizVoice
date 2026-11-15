@@ -1,4 +1,4 @@
-// Diagnostics: one JSON line per event in %APPDATA%/com.bizvoice.app/diagnostics.jsonl.
+// Diagnostics: one JSON line per event in diagnostics.jsonl in the app data folder.
 //
 // Written for an AI agent (or a human) to read later: every dictation records
 // what ran (provider, key label, timings, fallbacks), how it ended (ok, empty,
@@ -17,7 +17,6 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
 
-const APP_DIR: &str = "com.bizvoice.app";
 const FILE: &str = "diagnostics.jsonl";
 const CORRECTIONS: &str = "corrections.json";
 const MAX_BYTES: u64 = 2_000_000;
@@ -37,7 +36,7 @@ static LIVE_STASH: Mutex<Option<(String, Option<String>)>> = Mutex::new(None);
 static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn dir() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("APPDATA")?).join(APP_DIR))
+    crate::applog::data_dir()
 }
 
 pub fn path() -> Option<PathBuf> {
@@ -205,7 +204,7 @@ const README: &str = include_str!("diag_readme.md");
 /// README describing the format. Uses PowerShell's Compress-Archive so the app
 /// needs no zip dependency.
 pub fn export(settings: &Value) -> Result<PathBuf, String> {
-    let d = dir().ok_or("no APPDATA")?;
+    let d = dir().ok_or("no app data folder")?;
     let stamp = now_iso().replace([':', ' '], "-");
     let stage = d.join(format!("diag-export-{stamp}"));
     std::fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
@@ -233,6 +232,25 @@ pub fn export(settings: &Value) -> Result<PathBuf, String> {
         if !st.success() || !zip.exists() {
             return Err("Compress-Archive failed".into());
         }
+    }
+    // macOS: ditto writes a Finder-compatible zip of the folder's contents.
+    #[cfg(target_os = "macos")]
+    {
+        let st = std::process::Command::new("/usr/bin/ditto")
+            .args(["-c", "-k"])
+            .arg(&stage)
+            .arg(&zip)
+            .status()
+            .map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_dir_all(&stage);
+        if !st.success() || !zip.exists() {
+            return Err("ditto failed to create the zip".into());
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = std::fs::remove_dir_all(&stage);
+        return Err("Export is not supported on this OS yet".into());
     }
     Ok(zip)
 }

@@ -20,6 +20,8 @@ mod applog;
 mod commands;
 mod diag;
 mod keys;
+#[cfg(target_os = "macos")]
+mod macos;
 mod overlay;
 mod paste;
 mod pipeline;
@@ -205,6 +207,8 @@ pub fn run() {
                     }
                 });
             }
+            #[cfg(target_os = "macos")]
+            applog!("[paste] macOS accessibility trusted: {}", macos::accessibility_trusted(false));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -240,6 +244,7 @@ pub fn run() {
             commands::retry_last,
             commands::log_error,
             commands::set_mic_bar_expanded,
+            commands::ensure_paste_permission,
             commands::last_dictation_text,
             commands::submit_correction,
             commands::correction_suggestions,

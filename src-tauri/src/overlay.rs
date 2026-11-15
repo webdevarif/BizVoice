@@ -53,7 +53,12 @@ pub fn start_micbar_pin(app: &tauri::AppHandle) {
 }
 
 #[cfg(not(windows))]
-pub fn start_micbar_pin(_app: &tauri::AppHandle) {
-    // Topmost overlay re-pin is Windows-specific; other platforms rely on the
-    // window manager honouring alwaysOnTop from tauri.conf.json.
+pub fn start_micbar_pin(app: &tauri::AppHandle) {
+    // Topmost re-pin is Windows-specific. On macOS, alwaysOnTop alone keeps the
+    // bar on the Space it was created on, so it vanished when the user
+    // switched Spaces or opened a full-screen app; pin it to every Space.
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("micbar") {
+        let _ = w.set_visible_on_all_workspaces(true);
+    }
 }

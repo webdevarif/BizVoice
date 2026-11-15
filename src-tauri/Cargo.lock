@@ -318,9 +318,11 @@ dependencies = [
 
 [[package]]
 name = "bizvoice"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
+ "core-foundation",
+ "core-graphics",
  "futures-util",
  "hound",
  "regex",

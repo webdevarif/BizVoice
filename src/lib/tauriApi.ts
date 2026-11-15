@@ -109,6 +109,7 @@ const api: Window['api'] = {
   exportDiagnostics: () => invoke('export_diagnostics'),
   reviewDiagnostics: () => invoke('review_diagnostics'),
   setMicBarExpanded: (expanded: boolean) => invoke('set_mic_bar_expanded', { expanded }),
+  ensurePastePermission: () => invoke('ensure_paste_permission'),
 
   // ── Live transcription (realtime STT) ──
   liveStart: (inputLang?: string) => invoke('live_start', { forceLang: inputLang }),
@@ -219,6 +220,7 @@ declare global {
       exportDiagnostics: () => Promise<string>;
       reviewDiagnostics: () => Promise<string>;
       setMicBarExpanded: (expanded: boolean) => Promise<void>;
+      ensurePastePermission: () => Promise<boolean>;
       liveStart: (inputLang?: string) => Promise<void>;
       livePush: (chunk: string) => Promise<void>;
       liveStop: (inputLang?: string, durationMs?: number) => Promise<string>;
