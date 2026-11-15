@@ -285,7 +285,10 @@ export function Settings() {
       // Determine active mic (the default the browser actually uses)
       const def = devices.find((d) => d.kind === 'audioinput' && d.deviceId === 'default');
       setActiveMicLabel(def?.label?.replace(/^Default - /, '') || list[0]?.label || 'System default');
-    } catch {}
+    } catch (e: any) {
+      // Was silent, so a blocked mic looked like "no microphones".
+      void window.api.logError?.(`Settings mic list: ${e?.name || ''} ${e?.message || e}`);
+    }
   }
 
   async function loadWhisperModels(currentModel?: string) {

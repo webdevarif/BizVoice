@@ -62,6 +62,21 @@ function errText(err: unknown, fallback: string): string {
   return fallback;
 }
 
+/** WebKit (macOS) reports a blocked microphone as "Invalid constraint" or
+ *  NotAllowedError, which tells the user nothing. Say where to fix it. */
+function micError(err: unknown): Error {
+  const name = (err as { name?: string } | null)?.name || '';
+  const msg = errText(err, '');
+  const isMac = /Mac/i.test(navigator.platform || navigator.userAgent);
+  if (name === 'NotAllowedError' || name === 'SecurityError' || /invalid constraint|not allowed|denied/i.test(msg)) {
+    return new Error(isMac
+      ? 'Microphone blocked. Turn on BizVoice in System Settings > Privacy & Security > Microphone, then try again.'
+      : 'Microphone blocked. Allow microphone access for BizVoice in Windows Settings > Privacy > Microphone.');
+  }
+  if (name === 'NotFoundError') return new Error('No microphone found. Plug one in or pick another in Settings > Audio.');
+  return err instanceof Error ? err : new Error(msg || 'Microphone error');
+}
+
 let wavEncoderPromise: Promise<void> | null = null;
 function ensureWavEncoder(): Promise<void> {
   if (!wavEncoderPromise) {
@@ -334,7 +349,10 @@ export function MicBar() {
       return await tryGet(primary);
     } catch {
       try { return await tryGet(fallback); }
-      catch { return await tryGet(undefined); }
+      catch (e) {
+        try { return await tryGet(undefined); }
+        catch (last) { throw micError(last); }
+      }
     }
   }
 
