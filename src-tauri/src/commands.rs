@@ -426,6 +426,13 @@ pub async fn test_elevenlabs_key(app: tauri::AppHandle, id: String) -> Result<Va
     }
 
     let mut res = crate::pipeline::probe_elevenlabs_key(&key).await;
+    if res.get("ok").and_then(|v| v.as_bool()) == Some(true) && res.get("restricted").is_none() {
+        let left = match (res.get("charsLimit").and_then(|v| v.as_u64()), res.get("charsUsed").and_then(|v| v.as_u64())) {
+            (Some(l), Some(u)) => Some(l.saturating_sub(u)),
+            _ => None,
+        };
+        crate::keys::record_probe(&mask_key(&key), left, res.get("resetAt").and_then(|v| v.as_u64()));
+    }
     // A scope-restricted key can't show its balance, so add what the last
     // real dictation learned about it (see keys::record_usage).
     if res.get("restricted").and_then(|v| v.as_bool()).unwrap_or(false) {

@@ -414,6 +414,7 @@ export function Settings() {
         tier: res.tier,
         charsUsed: res.charsUsed ?? undefined,
         charsLimit: res.charsLimit ?? undefined,
+        resetAt: res.resetAt ?? undefined,
       });
     } catch (err: any) {
       updateElKey(id, { testing: false, status: 'fail', error: err?.message ?? 'Test failed' });
@@ -702,6 +703,22 @@ export function Settings() {
                             No key yet — premium transcription can't run until you add one.
                           </div>
                         )}
+
+                        {(() => {
+                          const known = elKeys.filter((r) => r.charsLimit != null && r.charsUsed != null);
+                          if (known.length === 0) return null;
+                          const left = known.reduce((a, r) => a + Math.max(0, r.charsLimit! - r.charsUsed!), 0);
+                          const now = Date.now() / 1000;
+                          const next = elKeys.map((r) => r.resetAt).filter((t): t is number => !!t && t > now).sort((a, b) => a - b)[0];
+                          return (
+                            <div className="flex items-center justify-between rounded-md border border-white/10 bg-white/[0.03] px-3 py-2 text-[12px]">
+                              <span className={left < 500 ? 'text-amber-300/90' : 'text-white/85'}>
+                                <span className="font-semibold">{nfmt.format(left)}</span> credits left across {known.length} key{known.length === 1 ? '' : 's'}
+                              </span>
+                              {next && <span className="text-white/50">next reset {fmtReset(next)}</span>}
+                            </div>
+                          );
+                        })()}
 
                         {elKeys.some((r) => r.spent) && (
                           <div className="flex items-center justify-between gap-2 rounded-md border border-amber-400/20 bg-amber-400/[0.05] px-3 py-2 text-[11px] text-amber-300/90">
@@ -1628,6 +1645,8 @@ interface ElKey {
   tier?: string;
   charsUsed?: number;
   charsLimit?: number;
+  /** Unix seconds when this account's credits refill. */
+  resetAt?: number;
   /** Last real request said this account is out of credits. */
   spent?: boolean;
 }
@@ -1642,6 +1661,11 @@ function readElKeys(s: any): ElKey[] {
 }
 
 const nfmt = new Intl.NumberFormat('en-US');
+
+/** "26 Nov, 4:47 PM" in the user's local time zone. */
+function fmtReset(unix: number): string {
+  return new Date(unix * 1000).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+}
 
 /** Donut showing how much of an account's quota is still available. Grey and
  *  dashless until a probe has run, so "not checked yet" never looks like zero. */
@@ -1766,6 +1790,7 @@ function ElKeyRow({ row, index, onChange, onSave, onRemove, onTest }: {
             {remaining !== null && row.charsLimit != null
               ? `${nfmt.format(remaining)} of ${nfmt.format(row.charsLimit)} credits left`
               : 'Working'}
+            {row.resetAt ? ` · resets ${fmtReset(row.resetAt)}` : ''}
           </div>
         )
       )}
