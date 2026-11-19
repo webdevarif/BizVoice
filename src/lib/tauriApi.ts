@@ -175,6 +175,8 @@ declare global {
         tier?: string;
         charsUsed?: number | null;
         charsLimit?: number | null;
+        /** Unix seconds when the account's credits refill. */
+        resetAt?: number | null;
         error?: string;
       }>;
       openSettings: () => Promise<void>;

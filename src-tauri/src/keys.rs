@@ -170,9 +170,8 @@ pub fn order<'a>(keys: &'a [(String, String)]) -> Vec<&'a (String, String)> {
     // last real request hit the quota go last; they are still tried, so a
     // refilled account recovers on its own.
     let usage = load_usage();
-    let spent = |l: &str| {
-        usage.get(&mask_of(l)).and_then(|u| u.get("state")).and_then(|s| s.as_str()).map_or(false, |s| s == "quota" || s == "flagged")
-    };
+    let now = now_unix();
+    let spent = |l: &str| is_spent(usage.get(&mask_of(l)), now);
     out.sort_by_key(|(l, _)| spent(l));
     out
 }
@@ -350,12 +349,80 @@ pub fn record_usage(label: &str, failure: Option<Failure>, msg: &str) {
         Some(Failure::RateLimited) => "rate_limited",
         Some(_) => return, // transient errors say nothing about the key
     };
+    let mask = mask_of(label);
     let mut e = serde_json::json!({ "state": state, "at": crate::applog::timestamp() });
     if let Some(n) = remaining_credits(msg) {
         e["remaining"] = serde_json::json!(n);
     }
-    m.insert(mask_of(label), e);
+    // Keep the reset time learned from a balance probe.
+    if let Some(r) = m.get(&mask).and_then(|o| o.get("reset_at")).cloned() {
+        e["reset_at"] = r;
+    }
+    m.insert(mask, e);
     let _ = std::fs::write(p, serde_json::to_string_pretty(&serde_json::Value::Object(m)).unwrap_or_default());
+}
+
+/// Store what a balance probe (Settings "Test") learned about a key: its
+/// remaining credits and when they refill.
+pub fn record_probe(mask: &str, remaining: Option<u64>, reset_at: Option<u64>) {
+    let Some(p) = usage_path() else { return };
+    let mut m = load_usage();
+    let mut e = m.get(mask).cloned().unwrap_or_else(|| serde_json::json!({}));
+    if let Some(r) = reset_at {
+        e["reset_at"] = serde_json::json!(r);
+    }
+    if let Some(n) = remaining {
+        e["remaining"] = serde_json::json!(n);
+        // A probe showing credits clears a stale "quota" mark (refilled).
+        if n > 0 && e.get("state").and_then(|s| s.as_str()) == Some("quota") {
+            e["state"] = serde_json::json!("ok");
+        }
+    }
+    e["probed_at"] = serde_json::json!(crate::applog::timestamp());
+    m.insert(mask.to_string(), e);
+    let _ = std::fs::write(p, serde_json::to_string_pretty(&serde_json::Value::Object(m)).unwrap_or_default());
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Spent = the last real request hit the quota (or a free-tier block) and the
+/// account has not refilled since. Past its reset time a key counts as fresh
+/// again, so a refilled account goes back to the front on its own.
+fn is_spent(entry: Option<&serde_json::Value>, now: u64) -> bool {
+    let Some(u) = entry else { return false };
+    let bad = matches!(u.get("state").and_then(|s| s.as_str()), Some("quota") | Some("flagged"));
+    let refilled = u.get("reset_at").and_then(|r| r.as_u64()).map_or(false, |r| r <= now);
+    bad && !refilled
+}
+
+/// "in 6 days" / "in 5 hours" / "in 20 minutes" until `ts`.
+pub fn humanize_until(ts: u64, now: u64) -> String {
+    let s = ts.saturating_sub(now);
+    let (n, unit) = if s >= 2 * 86_400 {
+        (s / 86_400, "days")
+    } else if s >= 2 * 3600 {
+        (s / 3600, "hours")
+    } else {
+        ((s / 60).max(1), "minutes")
+    };
+    let unit = if n == 1 { unit.trim_end_matches('s') } else { unit };
+    format!("in {n} {unit}")
+}
+
+/// The soonest future refill among these keys, e.g. " The next key refills in
+/// 6 days." Empty when unknown.
+pub fn next_reset_note(labels: &[&str]) -> String {
+    let usage = load_usage();
+    let now = now_unix();
+    labels
+        .iter()
+        .filter_map(|l| usage.get(&mask_of(l))?.get("reset_at")?.as_u64())
+        .filter(|r| *r > now)
+        .min()
+        .map(|r| format!(" The next key refills {}.", humanize_until(r, now)))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -366,5 +433,23 @@ mod usage_tests {
         assert_eq!(remaining_credits("exceeds your quota of 10000. You have 4 credits remaining, while 12"), Some(4));
         assert_eq!(remaining_credits("You have exceeded your quota."), None);
         assert_eq!(mask_of("key 3 (sk_3••••••f37d)"), "sk_3••••••f37d");
+    }
+
+    #[test]
+    fn spent_until_reset() {
+        let now = 1_000_000;
+        let q = |r: u64| serde_json::json!({"state": "quota", "reset_at": r});
+        assert!(is_spent(Some(&q(now + 10)), now));
+        assert!(!is_spent(Some(&q(now - 10)), now)); // refilled
+        assert!(is_spent(Some(&serde_json::json!({"state": "quota"})), now));
+        assert!(!is_spent(Some(&serde_json::json!({"state": "ok", "reset_at": now + 10})), now));
+        assert!(!is_spent(None, now));
+    }
+
+    #[test]
+    fn humanize() {
+        assert_eq!(humanize_until(1000 + 6 * 86_400 + 5, 1000), "in 6 days");
+        assert_eq!(humanize_until(1000 + 5 * 3600, 1000), "in 5 hours");
+        assert_eq!(humanize_until(1000 + 30, 1000), "in 1 minute");
     }
 }

@@ -409,6 +409,8 @@ pub async fn probe_elevenlabs_key(key: &str) -> Value {
         "tier": data.get("tier").and_then(|v| v.as_str()).unwrap_or(""),
         "charsUsed": data.get("character_count").and_then(|v| v.as_u64()),
         "charsLimit": data.get("character_limit").and_then(|v| v.as_u64()),
+        // Unix seconds when this account's monthly credits refill.
+        "resetAt": data.get("next_character_count_reset_unix").and_then(|v| v.as_u64()),
     })
 }
 
@@ -598,6 +600,10 @@ pub async fn scribe_stt(
     }
 
     Err(match worst {
+        Some(keys::Failure::Quota) => {
+            let labels: Vec<&str> = opts.elevenlabs_keys.iter().map(|(l, _)| l.as_str()).collect();
+            keys::explain(keys::Failure::Quota, &last) + &keys::next_reset_note(&labels)
+        }
         Some(f) => keys::explain(f, &last),
         None => last,
     })
