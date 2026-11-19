@@ -5,7 +5,7 @@
       "dmg"
     ],
     "macOS": {
-      "signingIdentity": "-",
+      "signingIdentity": "BizVoice Dev",
       "minimumSystemVersion": "11.0",
       "entitlements": "Entitlements.plist"
     }

@@ -200,6 +200,9 @@ pub fn mark_good(label: &str) {
 }
 
 pub fn mark_bad(label: &str, f: Failure) {
+    // Persist it too, so the live socket's quota errors (which never pass
+    // through the batch path) also push the key to the back after a restart.
+    record_usage(label, Some(f), "");
     if let Some(d) = f.cooldown() {
         if let Ok(mut h) = health().lock() {
             h.resting.insert(label.to_string(), Instant::now() + d);
@@ -339,6 +342,10 @@ pub fn load_usage() -> serde_json::Map<String, serde_json::Value> {
 
 /// Record the outcome of a real request with this key.
 pub fn record_usage(label: &str, failure: Option<Failure>, msg: &str) {
+    // Unit tests exercise mark_bad; never let them write the real file.
+    if cfg!(test) {
+        return;
+    }
     let Some(p) = usage_path() else { return };
     let mut m = load_usage();
     let state = match failure {
@@ -353,6 +360,10 @@ pub fn record_usage(label: &str, failure: Option<Failure>, msg: &str) {
     let mut e = serde_json::json!({ "state": state, "at": crate::applog::timestamp() });
     if let Some(n) = remaining_credits(msg) {
         e["remaining"] = serde_json::json!(n);
+    } else if failure.is_some() {
+        if let Some(r) = m.get(&mask).and_then(|o| o.get("remaining")).cloned() {
+            e["remaining"] = r;
+        }
     }
     // Keep the reset time learned from a balance probe.
     if let Some(r) = m.get(&mask).and_then(|o| o.get("reset_at")).cloned() {
@@ -390,9 +401,14 @@ fn now_unix() -> u64 {
 /// Spent = the last real request hit the quota (or a free-tier block) and the
 /// account has not refilled since. Past its reset time a key counts as fresh
 /// again, so a refilled account goes back to the front on its own.
+/// Below this many credits a key cannot carry a normal dictation (a 1-minute
+/// Bangla clip costs ~80), so it is treated like an empty one.
+pub const MIN_USEFUL_CREDITS: u64 = 50;
+
 fn is_spent(entry: Option<&serde_json::Value>, now: u64) -> bool {
     let Some(u) = entry else { return false };
-    let bad = matches!(u.get("state").and_then(|s| s.as_str()), Some("quota") | Some("flagged"));
+    let low = u.get("remaining").and_then(|r| r.as_u64()).map_or(false, |r| r < MIN_USEFUL_CREDITS);
+    let bad = low || matches!(u.get("state").and_then(|s| s.as_str()), Some("quota") | Some("flagged"));
     let refilled = u.get("reset_at").and_then(|r| r.as_u64()).map_or(false, |r| r <= now);
     bad && !refilled
 }
@@ -444,6 +460,10 @@ mod usage_tests {
         assert!(is_spent(Some(&serde_json::json!({"state": "quota"})), now));
         assert!(!is_spent(Some(&serde_json::json!({"state": "ok", "reset_at": now + 10})), now));
         assert!(!is_spent(None, now));
+        // 1 credit left is as good as none; refilled after reset.
+        assert!(is_spent(Some(&serde_json::json!({"state": "ok", "remaining": 1, "reset_at": now + 10})), now));
+        assert!(!is_spent(Some(&serde_json::json!({"state": "ok", "remaining": 1, "reset_at": now - 10})), now));
+        assert!(!is_spent(Some(&serde_json::json!({"state": "ok", "remaining": 4000})), now));
     }
 
     #[test]
